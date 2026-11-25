@@ -169,6 +169,10 @@ class CamState(context: Context) {
     var timelapseSec: Float = prefs.getFloat("timelapseSec", 0f)
         set(value) { field = value.coerceIn(0f, 60f); save() }
 
+    // v2: ultimo IP usado na tela de controle (conveniencia).
+    var lastRemoteIp: String = prefs.getString("lastRemoteIp", "") ?: ""
+        set(value) { field = value; save() }
+
     val mode: VideoMode get() = VideoModes.ALL[modeIndex]
 
     /** Bitrate efetivo do modo atual conforme o nivel (sempre visivel). */
@@ -226,6 +230,7 @@ class CamState(context: Context) {
             .putInt("trailDurationSec", trailDurationSec)
             .putInt("trailBlend", trailBlend)
             .putFloat("timelapseSec", timelapseSec)
+            .putString("lastRemoteIp", lastRemoteIp)
             .apply()
     }
 

@@ -162,6 +162,19 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         val fromSsd: Boolean
     )
 
+    // v2 Etapa 1: vinculo remoto (este aparelho como camera ou controle).
+    private var remoteServer: RemoteServer? = null
+    private var remoteClient: RemoteClient? = null
+    private var remoteCode: String = ""
+    private var remoteStateTick: Runnable? = null
+    private lateinit var controllerView: LinearLayout
+    private lateinit var controllerImage: ImageView
+    private lateinit var controllerState: TextView
+    private lateinit var controllerRec: Button
+    private lateinit var controllerIp: EditText
+    private lateinit var controllerCode: EditText
+    private var controllerRemoteRecording: Boolean = false
+
     private val cellValues = mutableMapOf<Control, TextView>()
     private val cellNames = mutableMapOf<Control, TextView>()
     private var selected: Control? = null
@@ -231,6 +244,9 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
     override fun onDestroy() {
         stopHudTick()
+        stopRemoteStateTick()
+        remoteServer?.stop()
+        remoteClient?.close()
         engine.close()
         bgThread.quitSafely()
         super.onDestroy()
@@ -539,6 +555,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         buildMediaView()
         buildSettingsView()
         buildViewerView()
+        buildControllerView()
         setContentView(rootFrame)
         refreshModeUi()
         refreshHud()
@@ -1581,6 +1598,316 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         }
     }
 
+    // ---------------------------------------------------------------
+    // v2 Etapa 1: vinculo remoto (camera controlada / controle)
+    // ---------------------------------------------------------------
+    private fun localIpAddress(): String {
+        return try {
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            var fallback = ""
+            while (interfaces.hasMoreElements()) {
+                val network = interfaces.nextElement()
+                if (!network.isUp || network.isLoopback) continue
+                val addresses = network.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val address = addresses.nextElement()
+                    if (address is java.net.Inet4Address &&
+                        !address.isLoopbackAddress
+                    ) {
+                        val ip = address.hostAddress ?: continue
+                        if (network.name.startsWith("wlan") ||
+                            network.name.startsWith("ap")
+                        ) {
+                            return ip
+                        }
+                        if (fallback.isEmpty()) fallback = ip
+                    }
+                }
+            }
+            fallback.ifEmpty { "desconhecido" }
+        } catch (e: Exception) {
+            "desconhecido"
+        }
+    }
+
+    private fun batteryPercent(): Int {
+        return try {
+            val manager = getSystemService(BatteryManager::class.java)
+            manager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                ?: -1
+        } catch (e: Exception) {
+            -1
+        }
+    }
+
+    private fun toggleRemoteCamera() {
+        val server = remoteServer
+        if (server != null && server.running) {
+            server.stop()
+            remoteServer = null
+            engine.remoteStreaming = false
+            stopRemoteStateTick()
+            showStatus("Vinculo desarmado: ninguem controla este aparelho.")
+            buildSettings()
+            return
+        }
+        remoteCode = (1000..9999).random().toString()
+        val created = RemoteServer(
+            remoteCode,
+            object : RemoteServer.Listener {
+                override fun onClientConnected() {
+                    engine.remoteStreaming = true
+                    uiHandler.post {
+                        showStatus("Controle conectado: monitor remoto ativo.")
+                        startRemoteStateTick()
+                        if (currentTab == TabKind.SETTINGS) buildSettings()
+                    }
+                }
+
+                override fun onClientDisconnected() {
+                    engine.remoteStreaming = false
+                    uiHandler.post {
+                        showStatus("Controle desconectou.")
+                        stopRemoteStateTick()
+                        if (currentTab == TabKind.SETTINGS) buildSettings()
+                    }
+                }
+
+                override fun onCommand(text: String) {
+                    uiHandler.post { handleRemoteCommand(text) }
+                }
+            }
+        )
+        remoteServer = created
+        created.start()
+        showStatus(
+            "Camera armada: IP ${localIpAddress()} · porta " +
+                "${RemoteProtocol.PORT} · codigo $remoteCode."
+        )
+        buildSettings()
+    }
+
+    private fun handleRemoteCommand(text: String) {
+        val command = text.removePrefix("CMD ").trim()
+        when (command) {
+            "REC_START" -> {
+                if (!engine.recording) onRecTapped()
+            }
+            "REC_STOP" -> {
+                if (engine.recording) onRecTapped()
+            }
+            "PHOTO" -> capturePhoto()
+        }
+        sendRemoteState()
+    }
+
+    private fun remoteStateLine(): String {
+        val readback = lastReadback
+        val iso = readback?.iso?.toString() ?: "-"
+        val shutter = readback?.exposureNs?.let {
+            CamState.formatShutterNs(it)
+        } ?: "-"
+        return "STATE rec=${if (engine.recording) 1 else 0} " +
+            "modo=${state.mode.label.replace(" ", "_")} " +
+            "iso=$iso obt=$shutter " +
+            "bat=${batteryPercent()}% " +
+            "dest=${if (state.destSsd) "SSD" else "interno"} " +
+            "tl=${state.timelapseSec}"
+    }
+
+    private fun sendRemoteState() {
+        remoteServer?.sendText(remoteStateLine())
+    }
+
+    private fun startRemoteStateTick() {
+        stopRemoteStateTick()
+        val runnable = object : Runnable {
+            override fun run() {
+                sendRemoteState()
+                uiHandler.postDelayed(this, 1000)
+            }
+        }
+        remoteStateTick = runnable
+        uiHandler.post(runnable)
+    }
+
+    private fun stopRemoteStateTick() {
+        remoteStateTick?.let { uiHandler.removeCallbacks(it) }
+        remoteStateTick = null
+    }
+
+    override fun onRemoteFrame(jpeg: ByteArray) {
+        remoteServer?.submitFrame(jpeg)
+    }
+
+    private fun buildControllerView() {
+        controllerView = LinearLayout(this)
+        controllerView.orientation = LinearLayout.VERTICAL
+        controllerView.setBackgroundColor(0xFF0B1220.toInt())
+        controllerView.setPadding(dp(12), dp(10), dp(12), dp(10))
+        controllerView.visibility = View.GONE
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.HORIZONTAL
+        header.gravity = Gravity.CENTER_VERTICAL
+        val title = label("CONTROLE REMOTO — DX Cam", 14f, Color.WHITE, bold = true)
+        header.addView(
+            title,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val closeButton = smallButton("FECHAR")
+        closeButton.setOnClickListener {
+            remoteClient?.close()
+            remoteClient = null
+            controllerView.visibility = View.GONE
+        }
+        header.addView(closeButton)
+        controllerView.addView(header)
+        val connectRow = LinearLayout(this)
+        connectRow.orientation = LinearLayout.HORIZONTAL
+        connectRow.gravity = Gravity.CENTER_VERTICAL
+        connectRow.setPadding(0, dp(6), 0, dp(6))
+        controllerIp = EditText(this)
+        controllerIp.hint = "IP da camera (ex.: 192.168.0.12)"
+        controllerIp.setText(state.lastRemoteIp)
+        controllerIp.setTextColor(Color.WHITE)
+        controllerIp.setHintTextColor(MUTED)
+        controllerIp.inputType =
+            android.text.InputType.TYPE_CLASS_TEXT
+        connectRow.addView(
+            controllerIp,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        controllerCode = EditText(this)
+        controllerCode.hint = "Codigo"
+        controllerCode.setTextColor(Color.WHITE)
+        controllerCode.setHintTextColor(MUTED)
+        controllerCode.inputType =
+            android.text.InputType.TYPE_CLASS_NUMBER
+        val codeParams = LinearLayout.LayoutParams(dp(90), ViewGroup.LayoutParams.WRAP_CONTENT)
+        codeParams.leftMargin = dp(6)
+        connectRow.addView(controllerCode, codeParams)
+        val connectButton = smallButton("CONECTAR")
+        connectButton.setOnClickListener { connectController() }
+        val connectParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        connectParams.leftMargin = dp(6)
+        connectRow.addView(connectButton, connectParams)
+        controllerView.addView(connectRow)
+        controllerImage = ImageView(this)
+        controllerImage.setBackgroundColor(Color.BLACK)
+        controllerImage.scaleType = ImageView.ScaleType.FIT_CENTER
+        controllerView.addView(
+            controllerImage,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+        )
+        controllerState = label(
+            "Sem conexao. Os dois aparelhos na mesma rede Wi-Fi; " +
+                "na camera: Configuracoes → armar como camera.",
+            12f, MUTED
+        )
+        controllerState.setPadding(0, dp(6), 0, dp(6))
+        controllerView.addView(controllerState)
+        val controls = LinearLayout(this)
+        controls.orientation = LinearLayout.HORIZONTAL
+        controls.gravity = Gravity.CENTER
+        controllerRec = Button(this)
+        controllerRec.text = "● REC"
+        controllerRec.setOnClickListener {
+            remoteClient?.sendCommand(
+                if (controllerRemoteRecording) "REC_STOP" else "REC_START"
+            )
+        }
+        controls.addView(
+            controllerRec,
+            LinearLayout.LayoutParams(dp(150), dp(54))
+        )
+        val photoButton = Button(this)
+        photoButton.text = "FOTO"
+        photoButton.setOnClickListener {
+            remoteClient?.sendCommand("PHOTO")
+        }
+        val photoParams = LinearLayout.LayoutParams(dp(110), dp(54))
+        photoParams.leftMargin = dp(10)
+        controls.addView(photoButton, photoParams)
+        controllerView.addView(controls)
+        rootFrame.addView(controllerView, overlayParams())
+    }
+
+    private fun openController() {
+        if (engine.recording) {
+            showStatus("Termine a gravacao para abrir o controle.")
+            return
+        }
+        controllerView.visibility = View.VISIBLE
+    }
+
+    private fun connectController() {
+        val ip = controllerIp.text.toString().trim()
+        val code = controllerCode.text.toString().trim()
+        if (ip.isEmpty() || code.isEmpty()) {
+            showStatus("Digite o IP da camera e o codigo de pareamento.")
+            return
+        }
+        state.lastRemoteIp = ip
+        remoteClient?.close()
+        val client = RemoteClient(
+            object : RemoteClient.Listener {
+                override fun onConnected() {
+                    uiHandler.post {
+                        controllerState.text =
+                            "Conectado em $ip. Aguardando a previa..."
+                        showStatus("Controle conectado na camera $ip.")
+                    }
+                }
+
+                override fun onFrame(jpeg: ByteArray) {
+                    val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+                    if (bitmap != null) {
+                        uiHandler.post { controllerImage.setImageBitmap(bitmap) }
+                    }
+                }
+
+                override fun onText(text: String) {
+                    if (text.startsWith("STATE ")) {
+                        uiHandler.post { applyControllerState(text) }
+                    }
+                }
+
+                override fun onDisconnected(message: String) {
+                    uiHandler.post {
+                        controllerRemoteRecording = false
+                        controllerRec.text = "● REC"
+                        controllerState.text = message
+                        showStatus(message)
+                    }
+                }
+            }
+        )
+        remoteClient = client
+        controllerState.text = "Conectando em $ip..."
+        client.connect(ip, code)
+    }
+
+    private fun applyControllerState(text: String) {
+        val fields = text.removePrefix("STATE ").split(" ")
+            .mapNotNull {
+                val parts = it.split("=", limit = 2)
+                if (parts.size == 2) parts[0] to parts[1] else null
+            }
+            .toMap()
+        controllerRemoteRecording = fields["rec"] == "1"
+        controllerRec.text =
+            if (controllerRemoteRecording) "■ PARAR" else "● REC"
+        controllerState.text =
+            "Modo ${fields["modo"] ?: "-"} · ISO ${fields["iso"] ?: "-"} · " +
+                "Obturador ${fields["obt"] ?: "-"} · Bateria ${fields["bat"] ?: "-"} · " +
+                "Destino ${fields["dest"] ?: "-"} · " +
+                if (controllerRemoteRecording) "GRAVANDO" else "em espera"
+    }
+
     private fun buildSettingsView() {
         settingsView = ScrollView(this)
         settingsView.setBackgroundColor(0xFF0B1220.toInt())
@@ -1775,6 +2102,40 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         lutSeekParams.leftMargin = dp(10)
         lutIntensityRow.addView(lutSeek, lutSeekParams)
 
+        settingsSection("VÍNCULO REMOTO (v2) — rede local, sem internet")
+        val remoteRow = sRow()
+        val server = remoteServer
+        val armed = server != null && server.running
+        val armButton = smallButton(
+            if (armed) "DESARMAR ESTA CÂMERA" else "ARMAR ESTE APARELHO COMO CÂMERA"
+        )
+        armButton.setOnClickListener { toggleRemoteCamera() }
+        remoteRow.addView(armButton)
+        val controlButton = smallButton("CONTROLAR OUTRO APARELHO")
+        controlButton.setOnClickListener { openController() }
+        val controlParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        controlParams.leftMargin = dp(8)
+        remoteRow.addView(controlButton, controlParams)
+        val remoteInfo = label(
+            if (armed) {
+                "Armada: IP ${localIpAddress()} · porta ${RemoteProtocol.PORT} · " +
+                    "codigo $remoteCode · " +
+                    if (server?.clientConnected == true) {
+                        "controle CONECTADO (monitor ativo)."
+                    } else {
+                        "aguardando o controle conectar."
+                    }
+            } else {
+                "Armar: este aparelho vira a camera controlada. " +
+                    "Controlar: este vira o controle (tablet) de outro " +
+                    "aparelho com o DX Cam. Os dois na mesma rede Wi-Fi."
+            },
+            11f, MUTED
+        )
+        settingsContainer.addView(remoteInfo)
+
         settingsSection("SOBRE")
         val free = try {
             val stat = StatFs(Environment.getDataDirectory().path)
@@ -1783,7 +2144,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "-"
         }
         val about = label(
-            "DX Cam v0.9.0-rastro — DX Labs\n" +
+            "DX Cam v2.0.0-link — DX Labs\n" +
                 "Camera de cinema para o S24: video manual, foto RAW, " +
                 "monitoramento e LUT so na previa.\n" +
                 "Espaco livre no aparelho: $free.",

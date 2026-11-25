@@ -8,6 +8,8 @@
          (compartilhar o relatorio) e segue disponivel. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- v2: vinculo remoto entre aparelhos na rede local (sem internet). -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <uses-feature
         android:name="android.hardware.camera"

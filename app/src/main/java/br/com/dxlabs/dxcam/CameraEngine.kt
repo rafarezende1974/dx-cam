@@ -75,6 +75,8 @@ class CameraEngine(
         fun onTrailProgress(frames: Int, elapsedMs: Long, totalMs: Long)
         /** Etapa 8: foto de rastro salva. */
         fun onTrailSaved(message: String)
+        /** v2: quadro JPEG (640x360) da previa para o monitor remoto. */
+        fun onRemoteFrame(jpeg: ByteArray)
     }
 
     data class Readback(
@@ -149,6 +151,11 @@ class CameraEngine(
     @Volatile
     var monitoringEnabled: Boolean = true
 
+    /** v2: ligado enquanto ha um controle remoto assistindo. */
+    @Volatile
+    var remoteStreaming: Boolean = false
+    private var lastRemoteFrameAt: Long = 0
+
     private var recorder: MediaRecorder? = null
     private val outputs = mutableListOf<OutputHandle>()
     private var currentOutput: OutputHandle? = null
@@ -215,6 +222,11 @@ class CameraEngine(
         } ?: return@OnImageAvailableListener
         try {
             val now = System.currentTimeMillis()
+            // v2: quadro do monitor remoto (JPEG do YUV de analise).
+            if (remoteStreaming && now - lastRemoteFrameAt >= 150) {
+                lastRemoteFrameAt = now
+                encodeRemoteJpeg(image)?.let { listener.onRemoteFrame(it) }
+            }
             if (!monitoringEnabled || now - lastAnalysisAt < 120) return@OnImageAvailableListener
             lastAnalysisAt = now
             val width = image.width
@@ -291,6 +303,44 @@ class CameraEngine(
                 image.close()
             } catch (e: Exception) {
             }
+        }
+    }
+
+    /** Codifica o quadro YUV de analise como JPEG para o controle. */
+    private fun encodeRemoteJpeg(image: Image): ByteArray? {
+        return try {
+            val width = image.width
+            val height = image.height
+            val yPlane = image.planes[0]
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
+            val nv21 = ByteArray(width * height + width * height / 2)
+            for (row in 0 until height) {
+                for (col in 0 until width) {
+                    nv21[row * width + col] = yPlane.buffer.get(
+                        row * yPlane.rowStride + col * yPlane.pixelStride
+                    )
+                }
+            }
+            var offset = width * height
+            for (row in 0 until height / 2) {
+                for (col in 0 until width / 2) {
+                    nv21[offset] = vPlane.buffer.get(
+                        row * vPlane.rowStride + col * vPlane.pixelStride
+                    )
+                    nv21[offset + 1] = uPlane.buffer.get(
+                        row * uPlane.rowStride + col * uPlane.pixelStride
+                    )
+                    offset += 2
+                }
+            }
+            val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            java.io.ByteArrayOutputStream().use { stream ->
+                yuvImage.compressToJpeg(Rect(0, 0, width, height), 65, stream)
+                stream.toByteArray()
+            }
+        } catch (e: Exception) {
+            null
         }
     }
 
