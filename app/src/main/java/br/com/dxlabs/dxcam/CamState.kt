@@ -139,6 +139,20 @@ class CamState(context: Context) {
     var zebraIre: Int = prefs.getInt("zebraIre", 95)
         set(value) { field = value.coerceIn(70, 100); save() }
 
+    // LUT (Etapa 5): arquivos .cube copiados para o armazenamento do
+    // app; a lista guarda os caminhos, um por linha.
+    var lutOn: Boolean = prefs.getBoolean("lutOn", false)
+        set(value) { field = value; save() }
+    var lutIntensity: Int = prefs.getInt("lutIntensity", 100)
+        set(value) { field = value.coerceIn(0, 100); save() }
+    var lutFiles: String = prefs.getString("lutFiles", "") ?: ""
+        set(value) { field = value; save() }
+    var lutActive: Int = prefs.getInt("lutActive", -1)
+        set(value) { field = value; save() }
+
+    fun lutPaths(): List<String> =
+        lutFiles.split("\n").filter { it.isNotBlank() }
+
     val mode: VideoMode get() = VideoModes.ALL[modeIndex]
 
     /** Bitrate efetivo do modo atual conforme o nivel (sempre visivel). */
@@ -188,6 +202,10 @@ class CamState(context: Context) {
             .putBoolean("metersOn", metersOn)
             .putBoolean("levelOn", levelOn)
             .putInt("zebraIre", zebraIre)
+            .putBoolean("lutOn", lutOn)
+            .putInt("lutIntensity", lutIntensity)
+            .putString("lutFiles", lutFiles)
+            .putInt("lutActive", lutActive)
             .apply()
     }
 

@@ -47,6 +47,9 @@ import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import java.io.ByteArrayInputStream
+import java.io.File
+import java.io.FileInputStream
 import java.util.Locale
 import kotlin.math.ln
 import kotlin.math.roundToInt
@@ -67,7 +70,7 @@ import kotlin.math.roundToInt
 class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
     private enum class Control { ISO, SHUTTER, WB, FOCUS, EV, ZOOM }
-    private enum class PanelKind { NONE, PARAM, MODE, MONITOR }
+    private enum class PanelKind { NONE, PARAM, MODE, MONITOR, LUT }
 
     private lateinit var state: CamState
     private lateinit var engine: CameraEngine
@@ -105,6 +108,16 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     private var meterTick: Runnable? = null
     private var peakDb: Float = -60f
 
+    // Etapa 5 (LUT): previa GL criada sob demanda, sobre a TextureView.
+    private lateinit var stage: FrameLayout
+    private var lutView: LutPreviewView? = null
+    private var lutSurface: android.view.Surface? = null
+    private var glPreviewActive: Boolean = false
+    private var lutCachePath: String? = null
+    private var lutCacheAtlas: java.nio.ByteBuffer? = null
+    private var lutCacheSize: Int = 0
+    private lateinit var lutButton: LinearLayout
+
     private val cellValues = mutableMapOf<Control, TextView>()
     private val cellNames = mutableMapOf<Control, TextView>()
     private var selected: Control? = null
@@ -128,6 +141,11 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
             maybeOpenEngine()
+        }
+
+    private val lutImportLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) importLut(uri)
         }
 
     private val treePickerLauncher =
@@ -176,6 +194,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
     override fun onResume() {
         super.onResume()
+        lutView?.onResume()
         startMeterTick()
         if (state.levelOn) registerLevelSensor()
         if (state.metersOn && !engine.recording) audioMeter.start()
@@ -185,6 +204,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         stopMeterTick()
         unregisterLevelSensor()
         audioMeter.stop()
+        lutView?.onPause()
         super.onPause()
     }
 
@@ -338,7 +358,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         rootRow.setBackgroundColor(Color.BLACK)
 
         // ---- Area da camera (visor + sobreposicoes) ----
-        val stage = FrameLayout(this)
+        stage = FrameLayout(this)
         stage.setBackgroundColor(Color.BLACK)
         rootRow.addView(
             stage,
@@ -769,9 +789,8 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         rail.addView(railButton("◯", "FOTO") {
             showStatus("Foto (RAW+JPEG) chega na Etapa 6.")
         })
-        rail.addView(railButton("LUT", "LUT") {
-            showStatus("LUT .cube chega na Etapa 5.")
-        })
+        lutButton = railButton("LUT", "LUT") { toggleLutPanel() }
+        rail.addView(lutButton)
         levelButton = railButton("◎", "NÍVEL") {
             state.levelOn = !state.levelOn
             applyLevelState()
@@ -1235,6 +1254,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             showMonitorPanel()
             return
         }
+        if (panelKind == PanelKind.LUT) {
+            showLutPanel()
+            return
+        }
         val control = selected ?: return
         val fps = state.mode.fps
         when (control) {
@@ -1481,6 +1504,264 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                     LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 )
             }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Etapa 5: LUT .cube (so na previa; o arquivo grava limpo)
+    // ---------------------------------------------------------------
+    private fun toggleLutPanel() {
+        panelKind = if (panelKind == PanelKind.LUT) PanelKind.NONE else PanelKind.LUT
+        selected = null
+        showPanel()
+        refreshHud()
+    }
+
+    private fun refreshLutButton() {
+        if (::lutButton.isInitialized) {
+            lutButton.setBackgroundColor(
+                if (state.lutOn) 0x33FFB300 else Color.TRANSPARENT
+            )
+        }
+    }
+
+    private fun ensureLutView(): LutPreviewView {
+        val existing = lutView
+        if (existing != null) return existing
+        val view = LutPreviewView(this)
+        view.setBufferSize(previewSizeUsed.width, previewSizeUsed.height)
+        view.onSurfaceReady = { surface ->
+            lutSurface = surface
+            if (state.lutOn && !glPreviewActive) {
+                if (engine.setPreviewSurface(surface)) {
+                    glPreviewActive = true
+                }
+            }
+        }
+        view.visibility = View.GONE
+        stage.addView(
+            view,
+            1,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        lutView = view
+        return view
+    }
+
+    private fun applyLutState() {
+        refreshLutButton()
+        if (engine.recording) {
+            // A troca de superficie reabre a sessao: nunca no meio da
+            // gravacao. O estado fica salvo e aplica ao parar.
+            return
+        }
+        val paths = state.lutPaths()
+        val activeOk = state.lutActive in paths.indices
+        if (state.lutOn && activeOk) {
+            val view = ensureLutView()
+            view.visibility = View.VISIBLE
+            loadLutIntoView(paths[state.lutActive])
+            view.setIntensity(state.lutIntensity / 100f)
+            val surface = lutSurface
+            if (surface != null && !glPreviewActive) {
+                if (engine.setPreviewSurface(surface)) {
+                    glPreviewActive = true
+                }
+            }
+        } else {
+            if (glPreviewActive) {
+                val texture = textureView.surfaceTexture
+                if (texture != null) {
+                    engine.setPreviewSurface(android.view.Surface(texture))
+                }
+                glPreviewActive = false
+            }
+            lutView?.visibility = View.GONE
+        }
+    }
+
+    private fun loadLutIntoView(path: String) {
+        val cachedAtlas = lutCacheAtlas
+        if (lutCachePath == path && cachedAtlas != null) {
+            cachedAtlas.position(0)
+            lutView?.setLut(cachedAtlas, lutCacheSize)
+            return
+        }
+        Thread {
+            try {
+                val data = FileInputStream(File(path)).use { input ->
+                    LutFile.parse(input, File(path).nameWithoutExtension)
+                }
+                val atlas = LutFile.buildAtlasRgba(data)
+                lutCachePath = path
+                lutCacheAtlas = atlas
+                lutCacheSize = data.size
+                uiHandler.post {
+                    if (state.lutOn &&
+                        state.lutPaths().getOrNull(state.lutActive) == path
+                    ) {
+                        atlas.position(0)
+                        lutView?.setLut(atlas, data.size)
+                    }
+                }
+            } catch (e: Exception) {
+                uiHandler.post {
+                    showStatus("Nao consegui ler a LUT: ${e.message}")
+                }
+            }
+        }.start()
+    }
+
+    private fun importLut(uri: android.net.Uri) {
+        showStatus("Importando a LUT...")
+        Thread {
+            try {
+                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: throw IllegalArgumentException("arquivo ilegivel")
+                val data = LutFile.parse(
+                    ByteArrayInputStream(bytes), "LUT"
+                )
+                val dir = File(filesDir, "luts")
+                dir.mkdirs()
+                val base = data.title
+                    .replace(Regex("[^A-Za-z0-9_-]"), "_")
+                    .take(32)
+                    .ifEmpty { "LUT" }
+                var file = File(dir, "$base.cube")
+                var counter = 2
+                while (file.exists()) {
+                    file = File(dir, "${base}_$counter.cube")
+                    counter += 1
+                }
+                file.writeBytes(bytes)
+                val paths = state.lutPaths().toMutableList()
+                paths.add(file.absolutePath)
+                state.lutFiles = paths.joinToString("\n")
+                state.lutActive = paths.lastIndex
+                state.lutOn = true
+                uiHandler.post {
+                    applyLutState()
+                    if (panelKind == PanelKind.LUT) showPanel()
+                    showStatus("LUT '${data.title}' ativa na previa.")
+                }
+            } catch (e: Exception) {
+                uiHandler.post {
+                    showStatus("Nao importei a LUT: ${e.message}")
+                }
+            }
+        }.start()
+    }
+
+    private fun showLutPanel() {
+        panelTitle("LUT .CUBE — só na prévia; o arquivo grava limpo")
+        val paths = state.lutPaths()
+        if (paths.isEmpty()) {
+            val empty = label(
+                "Nenhuma LUT importada ainda. Importe os .cube que voce " +
+                    "usa no Premiere.",
+                12f, MUTED
+            )
+            empty.setPadding(0, dp(4), 0, dp(4))
+            panel.addView(empty)
+        } else {
+            var index = 0
+            while (index < paths.size) {
+                val row = panelRow()
+                for (offset in 0 until 3) {
+                    val lutIndex = index + offset
+                    if (lutIndex >= paths.size) break
+                    val name = File(paths[lutIndex]).nameWithoutExtension
+                    val chip = chipButton(
+                        name, state.lutActive == lutIndex && state.lutOn
+                    ) {
+                        if (engine.recording) {
+                            showStatus("LUT so muda com a gravacao parada.")
+                        } else {
+                            state.lutActive = lutIndex
+                            state.lutOn = true
+                            applyLutState()
+                            showPanel()
+                        }
+                    }
+                    val chipParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                    chipParams.rightMargin = dp(6)
+                    row.addView(chip, chipParams)
+                }
+                index += 3
+            }
+        }
+        val row = panelRow()
+        val toggleChip = chipButton(
+            if (state.lutOn) "LUT: LIGADA" else "LUT: DESLIGADA", state.lutOn
+        ) {
+            if (engine.recording) {
+                showStatus("LUT so muda com a gravacao parada.")
+            } else if (state.lutPaths().isEmpty()) {
+                showStatus("Importe uma LUT primeiro.")
+            } else {
+                state.lutOn = !state.lutOn
+                if (state.lutOn && state.lutActive !in state.lutPaths().indices) {
+                    state.lutActive = 0
+                }
+                applyLutState()
+                showPanel()
+            }
+        }
+        row.addView(toggleChip)
+        val intensityLabel = label(
+            "Intensidade ${state.lutIntensity}%", 12f, Color.WHITE, bold = true
+        )
+        val intensityParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        intensityParams.leftMargin = dp(12)
+        row.addView(intensityLabel, intensityParams)
+        val row2 = panelRow()
+        row2.addView(
+            seekBar(100, state.lutIntensity) {
+                state.lutIntensity = it
+                intensityLabel.text = "Intensidade $it%"
+                lutView?.setIntensity(it / 100f)
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val row3 = panelRow()
+        val importButton = smallButton("IMPORTAR .CUBE")
+        importButton.setOnClickListener {
+            lutImportLauncher.launch(arrayOf("*/*"))
+        }
+        row3.addView(importButton)
+        if (paths.isNotEmpty() && state.lutActive in paths.indices) {
+            val removeButton = smallButton("REMOVER A ATIVA")
+            removeButton.setOnClickListener {
+                val removed = paths[state.lutActive]
+                try {
+                    File(removed).delete()
+                } catch (e: Exception) {
+                }
+                val remaining = paths.toMutableList()
+                remaining.removeAt(state.lutActive)
+                state.lutFiles = remaining.joinToString("\n")
+                state.lutActive = if (remaining.isEmpty()) -1 else 0
+                if (remaining.isEmpty()) state.lutOn = false
+                lutCachePath = null
+                lutCacheAtlas = null
+                applyLutState()
+                showPanel()
+                showStatus("LUT removida.")
+            }
+            val removeParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            removeParams.leftMargin = dp(8)
+            row3.addView(removeButton, removeParams)
         }
     }
 
@@ -1868,6 +2149,8 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             if (firstReadback) {
                 firstReadback = false
                 showStatus("Camera pronta. Toque num parametro no topo para ajustar.")
+                if (state.lutOn) applyLutState()
+                refreshLutButton()
             }
             refreshHud()
         }
@@ -1894,6 +2177,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 )
                 stopHudTick()
                 refreshStorage()
+                if (state.lutOn) applyLutState()
             }
         }
     }

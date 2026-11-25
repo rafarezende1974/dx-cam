@@ -193,6 +193,25 @@ class CameraEngine(
         }
     }
 
+    /**
+     * Etapa 5: troca a superficie de previa (TextureView comum <-> GL
+     * com LUT). Recria so a sessao; o aparelho segue aberto. Durante a
+     * gravacao recusa (a troca reabriria a sessao do gravador).
+     */
+    fun setPreviewSurface(surface: Surface): Boolean {
+        if (recording || transitioning) return false
+        previewSurface = surface
+        if (device != null) {
+            try {
+                session?.close()
+            } catch (e: Exception) {
+            }
+            session = null
+            createSession(null)
+        }
+        return true
+    }
+
     /** Amplitude maxima do microfone desde a ultima chamada (gravando). */
     fun currentMaxAmplitude(): Int {
         if (!recording) return 0
