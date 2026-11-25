@@ -174,6 +174,13 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     private lateinit var controllerIp: EditText
     private lateinit var controllerCode: EditText
     private var controllerRemoteRecording: Boolean = false
+    private lateinit var ctlIsoVal: TextView
+    private lateinit var ctlShutVal: TextView
+    private lateinit var ctlWbVal: TextView
+    private lateinit var ctlFocusVal: TextView
+    private lateinit var ctlEvVal: TextView
+    private lateinit var ctlZoomVal: TextView
+    private var ctlFields: Map<String, String> = emptyMap()
 
     private val cellValues = mutableMapOf<Control, TextView>()
     private val cellNames = mutableMapOf<Control, TextView>()
@@ -1689,16 +1696,53 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
     private fun handleRemoteCommand(text: String) {
         val command = text.removePrefix("CMD ").trim()
-        when (command) {
-            "REC_START" -> {
+        when {
+            command == "REC_START" -> {
                 if (!engine.recording) onRecTapped()
             }
-            "REC_STOP" -> {
+            command == "REC_STOP" -> {
                 if (engine.recording) onRecTapped()
             }
-            "PHOTO" -> capturePhoto()
+            command == "PHOTO" -> capturePhoto()
+            command.startsWith("SET ") -> {
+                val parts = command.split(" ")
+                if (parts.size == 3) applyRemoteSet(parts[1], parts[2])
+            }
         }
         sendRemoteState()
+    }
+
+    /** v2 Etapa 2: aplica um ajuste vindo do controle remoto. */
+    private fun applyRemoteSet(key: String, value: String) {
+        when (key) {
+            "iso" -> value.toIntOrNull()?.let {
+                state.isoAuto = false
+                state.iso = it
+            }
+            "isoAuto" -> state.isoAuto = value == "1"
+            "angle" -> value.toFloatOrNull()?.let {
+                state.shutterAuto = false
+                state.shutterKind = CamState.ShutterKind.ANGLE
+                state.angleDeg = it
+            }
+            "shutterAuto" -> state.shutterAuto = value == "1"
+            "kelvin" -> value.toIntOrNull()?.let {
+                state.wbAuto = false
+                state.kelvin = it
+            }
+            "wbAuto" -> state.wbAuto = value == "1"
+            "focusM" -> value.toFloatOrNull()?.let { meters ->
+                state.focusMode = CamState.FocusMode.MANUAL
+                state.focusDiopters = if (meters <= 0f) 0f else 1f / meters
+            }
+            "focusAF" -> state.focusMode = CamState.FocusMode.CONTINUOUS
+            "ev" -> value.toFloatOrNull()?.let { state.ev = it }
+            "zoom" -> value.toFloatOrNull()?.let { state.zoomRatio = it }
+            else -> return
+        }
+        engine.applyState()
+        refreshHud()
+        if (panel.visibility == View.VISIBLE) showPanel()
     }
 
     private fun remoteStateLine(): String {
@@ -1707,12 +1751,25 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         val shutter = readback?.exposureNs?.let {
             CamState.formatShutterNs(it)
         } ?: "-"
+        val focusMeters = if (state.focusDiopters <= 0.01f) {
+            "inf"
+        } else {
+            String.format(Locale.US, "%.2f", 1f / state.focusDiopters)
+        }
         return "STATE rec=${if (engine.recording) 1 else 0} " +
             "modo=${state.mode.label.replace(" ", "_")} " +
             "iso=$iso obt=$shutter " +
             "bat=${batteryPercent()}% " +
             "dest=${if (state.destSsd) "SSD" else "interno"} " +
-            "tl=${state.timelapseSec}"
+            "tl=${state.timelapseSec} " +
+            "isos=${state.iso} ia=${if (state.isoAuto) 1 else 0} " +
+            "sa=${if (state.shutterAuto) 1 else 0} " +
+            "ang=${String.format(Locale.US, "%.1f", state.angleDeg)} " +
+            "kel=${state.kelvin} wa=${if (state.wbAuto) 1 else 0} " +
+            "fm=${if (state.focusMode == CamState.FocusMode.MANUAL) "MAN" else "AF"} " +
+            "fd=$focusMeters " +
+            "ev=${String.format(Locale.US, "%.1f", state.ev)} " +
+            "zm=${String.format(Locale.US, "%.1f", state.zoomRatio)}"
     }
 
     private fun sendRemoteState() {
@@ -1810,6 +1867,49 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         )
         controllerState.setPadding(0, dp(6), 0, dp(6))
         controllerView.addView(controllerState)
+        val stepsBox = LinearLayout(this)
+        stepsBox.orientation = LinearLayout.VERTICAL
+        ctlIsoVal = addStepperRow(
+            stepsBox, "ISO", true,
+            { stepIso(-1) }, { stepIso(1) },
+            {
+                remoteClient?.sendCommand(
+                    "SET isoAuto ${if (ctlFields["ia"] == "1") "0" else "1"}"
+                )
+            }
+        )
+        ctlShutVal = addStepperRow(
+            stepsBox, "OBTURADOR", true,
+            { stepAngle(-1) }, { stepAngle(1) },
+            {
+                remoteClient?.sendCommand(
+                    "SET shutterAuto ${if (ctlFields["sa"] == "1") "0" else "1"}"
+                )
+            }
+        )
+        ctlWbVal = addStepperRow(
+            stepsBox, "BRANCO", true,
+            { stepKelvin(-100) }, { stepKelvin(100) },
+            {
+                remoteClient?.sendCommand(
+                    "SET wbAuto ${if (ctlFields["wa"] == "1") "0" else "1"}"
+                )
+            }
+        )
+        ctlFocusVal = addStepperRow(
+            stepsBox, "FOCO", true,
+            { stepFocus(-1) }, { stepFocus(1) },
+            { remoteClient?.sendCommand("SET focusAF 1") }
+        )
+        ctlEvVal = addStepperRow(
+            stepsBox, "EV", false,
+            { stepEv(-0.5f) }, { stepEv(0.5f) }, null
+        )
+        ctlZoomVal = addStepperRow(
+            stepsBox, "ZOOM", false,
+            { stepZoom(-1) }, { stepZoom(1) }, null
+        )
+        controllerView.addView(stepsBox)
         val controls = LinearLayout(this)
         controls.orientation = LinearLayout.HORIZONTAL
         controls.gravity = Gravity.CENTER
@@ -1842,6 +1942,120 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             return
         }
         controllerView.visibility = View.VISIBLE
+    }
+
+    /** Linha de ajuste do controle: titulo, -, valor, +, AUTO opcional. */
+    private fun addStepperRow(
+        parent: LinearLayout,
+        title: String,
+        hasAuto: Boolean,
+        onMinus: () -> Unit,
+        onPlus: () -> Unit,
+        onAuto: (() -> Unit)?
+    ): TextView {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(0, dp(1), 0, dp(1))
+        val titleView = label(title, 11f, MUTED, bold = true)
+        row.addView(titleView, LinearLayout.LayoutParams(dp(86), ViewGroup.LayoutParams.WRAP_CONTENT))
+        val minus = smallButton("−")
+        minus.setOnClickListener { onMinus() }
+        row.addView(minus)
+        val value = label("—", 12.5f, Color.WHITE, bold = true)
+        value.gravity = Gravity.CENTER
+        row.addView(
+            value,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val plus = smallButton("+")
+        plus.setOnClickListener { onPlus() }
+        row.addView(plus)
+        if (hasAuto && onAuto != null) {
+            val auto = smallButton("AUTO")
+            auto.setOnClickListener { onAuto() }
+            val autoParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            autoParams.leftMargin = dp(6)
+            row.addView(auto, autoParams)
+        }
+        parent.addView(row)
+        return value
+    }
+
+    private fun stepIso(dir: Int) {
+        val current = ctlFields["isos"]?.toIntOrNull() ?: state.iso
+        val next = (CamState.isoIndexOf(current) + dir)
+            .coerceIn(0, CamState.ISO_STEPS.lastIndex)
+        remoteClient?.sendCommand("SET iso ${CamState.ISO_STEPS[next]}")
+    }
+
+    private fun stepAngle(dir: Int) {
+        val current = ctlFields["ang"]?.toFloatOrNull() ?: 180f
+        val next = (CamState.angleIndexOf(current) + dir)
+            .coerceIn(0, CamState.ANGLE_STEPS.lastIndex)
+        remoteClient?.sendCommand(
+            "SET angle ${CamState.ANGLE_STEPS[next]}"
+        )
+    }
+
+    private fun stepKelvin(delta: Int) {
+        val current = ctlFields["kel"]?.toIntOrNull() ?: 5600
+        val next = (current + delta).coerceIn(2300, 8000)
+        remoteClient?.sendCommand("SET kelvin $next")
+    }
+
+    private fun stepFocus(dir: Int) {
+        val steps = floatArrayOf(
+            0.1f, 0.15f, 0.25f, 0.35f, 0.5f, 0.7f, 1f, 1.5f, 2f, 3f, 5f,
+            10f, 100f
+        )
+        val currentText = ctlFields["fd"] ?: "inf"
+        val current = if (currentText == "inf") {
+            100f
+        } else {
+            currentText.toFloatOrNull() ?: 100f
+        }
+        var nearest = 0
+        var best = Float.MAX_VALUE
+        for ((index, step) in steps.withIndex()) {
+            val diff = kotlin.math.abs(step - current)
+            if (diff < best) {
+                best = diff
+                nearest = index
+            }
+        }
+        val next = (nearest + dir).coerceIn(0, steps.lastIndex)
+        remoteClient?.sendCommand(
+            "SET focusM ${String.format(Locale.US, "%.2f", steps[next])}"
+        )
+    }
+
+    private fun stepEv(delta: Float) {
+        val current = ctlFields["ev"]?.toFloatOrNull() ?: 0f
+        val next = (current + delta).coerceIn(-2f, 2f)
+        remoteClient?.sendCommand(
+            "SET ev ${String.format(Locale.US, "%.1f", next)}"
+        )
+    }
+
+    private fun stepZoom(dir: Int) {
+        val steps = floatArrayOf(0.6f, 1f, 1.5f, 2f, 3f, 5f, 7f, 10f)
+        val current = ctlFields["zm"]?.toFloatOrNull() ?: 1f
+        var nearest = 1
+        var best = Float.MAX_VALUE
+        for ((index, step) in steps.withIndex()) {
+            val diff = kotlin.math.abs(step - current)
+            if (diff < best) {
+                best = diff
+                nearest = index
+            }
+        }
+        val next = (nearest + dir).coerceIn(0, steps.lastIndex)
+        remoteClient?.sendCommand(
+            "SET zoom ${String.format(Locale.US, "%.1f", steps[next])}"
+        )
     }
 
     private fun connectController() {
@@ -1898,6 +2112,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 if (parts.size == 2) parts[0] to parts[1] else null
             }
             .toMap()
+        ctlFields = fields
         controllerRemoteRecording = fields["rec"] == "1"
         controllerRec.text =
             if (controllerRemoteRecording) "■ PARAR" else "● REC"
@@ -1906,6 +2121,35 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 "Obturador ${fields["obt"] ?: "-"} · Bateria ${fields["bat"] ?: "-"} · " +
                 "Destino ${fields["dest"] ?: "-"} · " +
                 if (controllerRemoteRecording) "GRAVANDO" else "em espera"
+        ctlIsoVal.text = if (fields["ia"] == "1") {
+            "AUTO · lendo ${fields["iso"] ?: "-"}"
+        } else {
+            "ISO ${fields["isos"] ?: "-"}"
+        }
+        ctlShutVal.text = if (fields["sa"] == "1") {
+            "AUTO"
+        } else {
+            "${fields["ang"] ?: "-"}°"
+        }
+        ctlWbVal.text = if (fields["wa"] == "1") {
+            "AUTO"
+        } else {
+            "${fields["kel"] ?: "-"} K"
+        }
+        ctlFocusVal.text = if (fields["fm"] == "AF") {
+            "AF continuo"
+        } else if (fields["fd"] == "inf") {
+            "Manual · infinito"
+        } else {
+            "Manual · ${fields["fd"] ?: "-"} m"
+        }
+        val evValue = fields["ev"]?.toFloatOrNull() ?: 0f
+        ctlEvVal.text = if (evValue == 0f) {
+            "0 EV"
+        } else {
+            String.format(Locale.US, "%+.1f EV", evValue)
+        }
+        ctlZoomVal.text = "${fields["zm"] ?: "-"}x"
     }
 
     private fun buildSettingsView() {
@@ -2144,7 +2388,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "-"
         }
         val about = label(
-            "DX Cam v2.0.0-link — DX Labs\n" +
+            "DX Cam v2.1.0-controle — DX Labs\n" +
                 "Camera de cinema para o S24: video manual, foto RAW, " +
                 "monitoramento e LUT so na previa.\n" +
                 "Espaco livre no aparelho: $free.",
