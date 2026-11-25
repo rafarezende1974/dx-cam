@@ -1708,6 +1708,14 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 val parts = command.split(" ")
                 if (parts.size == 3) applyRemoteSet(parts[1], parts[2])
             }
+            command.startsWith("TAPFOCUS ") -> {
+                val parts = command.split(" ")
+                val fx = parts.getOrNull(1)?.toFloatOrNull()
+                val fy = parts.getOrNull(2)?.toFloatOrNull()
+                if (fx != null && fy != null) {
+                    applyTapFocusFraction(fx, fy)
+                }
+            }
         }
         sendRemoteState()
     }
@@ -1722,7 +1730,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "isoAuto" -> state.isoAuto = value == "1"
             "angle" -> value.toFloatOrNull()?.let {
                 state.shutterAuto = false
-                state.shutterKind = CamState.ShutterKind.ANGLE
+                state.shutterKind = ShutterKind.ANGLE
                 state.angleDeg = it
             }
             "shutterAuto" -> state.shutterAuto = value == "1"
@@ -1732,10 +1740,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             }
             "wbAuto" -> state.wbAuto = value == "1"
             "focusM" -> value.toFloatOrNull()?.let { meters ->
-                state.focusMode = CamState.FocusMode.MANUAL
+                state.focusMode = FocusMode.MANUAL
                 state.focusDiopters = if (meters <= 0f) 0f else 1f / meters
             }
-            "focusAF" -> state.focusMode = CamState.FocusMode.CONTINUOUS
+            "focusAF" -> state.focusMode = FocusMode.CONTINUOUS
             "ev" -> value.toFloatOrNull()?.let { state.ev = it }
             "zoom" -> value.toFloatOrNull()?.let { state.zoomRatio = it }
             else -> return
@@ -1743,6 +1751,23 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         engine.applyState()
         refreshHud()
         if (panel.visibility == View.VISIBLE) showPanel()
+    }
+
+    /** v2 Etapa 3: foco por toque vindo do controle (fracoes 0-1). */
+    private fun applyTapFocusFraction(fx: Float, fy: Float) {
+        if (state.focusMode == FocusMode.MANUAL) {
+            showStatus(
+                "O controle pediu foco por toque, mas a camera esta " +
+                    "em foco manual."
+            )
+            return
+        }
+        if (state.focusMode != FocusMode.TOUCH) {
+            state.focusMode = FocusMode.TOUCH
+        }
+        showReticle(fx * textureView.width, fy * textureView.height)
+        engine.tapFocus(fx.coerceIn(0f, 1f), fy.coerceIn(0f, 1f))
+        refreshHud()
     }
 
     private fun remoteStateLine(): String {
@@ -1766,7 +1791,11 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "sa=${if (state.shutterAuto) 1 else 0} " +
             "ang=${String.format(Locale.US, "%.1f", state.angleDeg)} " +
             "kel=${state.kelvin} wa=${if (state.wbAuto) 1 else 0} " +
-            "fm=${if (state.focusMode == CamState.FocusMode.MANUAL) "MAN" else "AF"} " +
+            "fm=${when (state.focusMode) {
+                FocusMode.MANUAL -> "MAN"
+                FocusMode.TOUCH -> "TOQ"
+                else -> "AF"
+            }} " +
             "fd=$focusMeters " +
             "ev=${String.format(Locale.US, "%.1f", state.ev)} " +
             "zm=${String.format(Locale.US, "%.1f", state.zoomRatio)}"
@@ -1854,6 +1883,13 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         controllerImage = ImageView(this)
         controllerImage.setBackgroundColor(Color.BLACK)
         controllerImage.scaleType = ImageView.ScaleType.FIT_CENTER
+        controllerImage.setOnTouchListener { view, event ->
+            if (event.action == android.view.MotionEvent.ACTION_UP) {
+                view.performClick()
+                sendTapFocus(event.x, event.y, view.width, view.height)
+            }
+            true
+        }
         controllerView.addView(
             controllerImage,
             LinearLayout.LayoutParams(
@@ -1982,6 +2018,33 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         }
         parent.addView(row)
         return value
+    }
+
+    /**
+     * Toque na previa do controle: converte o toque (com a faixa
+     * letterbox do FIT_CENTER) em fracoes da imagem 640x360 e manda o
+     * comando de foco para a camera.
+     */
+    private fun sendTapFocus(x: Float, y: Float, viewW: Int, viewH: Int) {
+        if (viewW == 0 || viewH == 0) return
+        val imageW = 640f
+        val imageH = 360f
+        val scale = minOf(viewW / imageW, viewH / imageH)
+        val dispW = imageW * scale
+        val dispH = imageH * scale
+        val offX = (viewW - dispW) / 2f
+        val offY = (viewH - dispH) / 2f
+        val fx = (x - offX) / dispW
+        val fy = (y - offY) / dispH
+        if (fx < 0f || fx > 1f || fy < 0f || fy > 1f) {
+            showStatus("Toque fora da imagem: mire dentro da previa.")
+            return
+        }
+        remoteClient?.sendCommand(
+            "TAPFOCUS ${String.format(Locale.US, "%.3f", fx)} " +
+                String.format(Locale.US, "%.3f", fy)
+        )
+        showStatus("Foco por toque enviado para a camera.")
     }
 
     private fun stepIso(dir: Int) {
@@ -2138,6 +2201,8 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         }
         ctlFocusVal.text = if (fields["fm"] == "AF") {
             "AF continuo"
+        } else if (fields["fm"] == "TOQ") {
+            "Por toque (na previa)"
         } else if (fields["fd"] == "inf") {
             "Manual · infinito"
         } else {
@@ -2388,7 +2453,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "-"
         }
         val about = label(
-            "DX Cam v2.1.0-controle — DX Labs\n" +
+            "DX Cam v2.2.0-toque — DX Labs\n" +
                 "Camera de cinema para o S24: video manual, foto RAW, " +
                 "monitoramento e LUT so na previa.\n" +
                 "Espaco livre no aparelho: $free.",
