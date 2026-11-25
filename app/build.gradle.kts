@@ -13,8 +13,8 @@ android {
         applicationId = "br.com.dxlabs.dxcam"
         minSdk = 33
         targetSdk = 36
-        versionCode = 16
-        versionName = "2.2.0-toque"
+        versionCode = 17
+        versionName = "2.3.0-lapela"
     }
 
     buildTypes {

@@ -23,6 +23,7 @@ object RemoteProtocol {
     const val PORT: Int = 47777
     const val TYPE_FRAME: Byte = 'J'.code.toByte()
     const val TYPE_TEXT: Byte = 'T'.code.toByte()
+    const val TYPE_AUDIO: Byte = 'A'.code.toByte()
 
     fun writePacket(out: DataOutputStream, type: Byte, payload: ByteArray) {
         synchronized(out) {
@@ -60,6 +61,11 @@ class RemoteServer(
         fun onClientConnected()
         fun onClientDisconnected()
         fun onCommand(text: String)
+        /** Etapa 4 (lapela): um aparelho conectou como microfone. */
+        fun onMicConnected()
+        fun onMicDisconnected()
+        fun onMicText(text: String)
+        fun onAudio(pcm: ByteArray)
     }
 
     @Volatile
@@ -73,6 +79,11 @@ class RemoteServer(
     private var serverSocket: ServerSocket? = null
     private var clientSocket: Socket? = null
     private var clientOut: DataOutputStream? = null
+    private var micSocket: Socket? = null
+
+    @Volatile
+    var micConnected: Boolean = false
+        private set
 
     @Volatile
     private var latestFrame: ByteArray? = null
@@ -91,10 +102,15 @@ class RemoteServer(
         } catch (e: Exception) {
         }
         try {
+            micSocket?.close()
+        } catch (e: Exception) {
+        }
+        try {
             serverSocket?.close()
         } catch (e: Exception) {
         }
         clientConnected = false
+        micConnected = false
         clientOut = null
     }
 
@@ -152,13 +168,8 @@ class RemoteServer(
     }
 
     private fun handleClient(socket: Socket) {
-        // Um controle por vez: conexao nova derruba a anterior.
-        try {
-            clientSocket?.close()
-        } catch (e: Exception) {
-        }
-        clientSocket = socket
         Thread {
+            var isMic = false
             try {
                 val input = DataInputStream(
                     BufferedInputStream(socket.getInputStream())
@@ -174,31 +185,73 @@ class RemoteServer(
                         ""
                     }
                 } ?: ""
-                if (authText != "AUTH $pairingCode") {
+                isMic = authText == "AUTH $pairingCode MIC"
+                if (!isMic && authText != "AUTH $pairingCode") {
                     RemoteProtocol.writeText(out, "ERR codigo")
                     socket.close()
                     return@Thread
                 }
-                clientOut = out
-                clientConnected = true
                 RemoteProtocol.writeText(out, "OK DX Cam")
-                listener.onClientConnected()
-                while (running && !socket.isClosed) {
-                    val packet = RemoteProtocol.readPacket(input) ?: break
-                    if (packet.first == RemoteProtocol.TYPE_TEXT) {
-                        listener.onCommand(String(packet.second, Charsets.UTF_8))
+                if (isMic) {
+                    // Um microfone por vez: conexao nova derruba a outra.
+                    try {
+                        micSocket?.close()
+                    } catch (e: Exception) {
+                    }
+                    micSocket = socket
+                    micConnected = true
+                    listener.onMicConnected()
+                    while (running && !socket.isClosed) {
+                        val packet = RemoteProtocol.readPacket(input) ?: break
+                        when (packet.first) {
+                            RemoteProtocol.TYPE_AUDIO ->
+                                listener.onAudio(packet.second)
+                            RemoteProtocol.TYPE_TEXT ->
+                                listener.onMicText(
+                                    String(packet.second, Charsets.UTF_8)
+                                )
+                        }
+                    }
+                } else {
+                    // Um controle por vez: conexao nova derruba a outra.
+                    try {
+                        clientSocket?.close()
+                    } catch (e: Exception) {
+                    }
+                    clientSocket = socket
+                    clientOut = out
+                    clientConnected = true
+                    listener.onClientConnected()
+                    while (running && !socket.isClosed) {
+                        val packet = RemoteProtocol.readPacket(input) ?: break
+                        if (packet.first == RemoteProtocol.TYPE_TEXT) {
+                            listener.onCommand(
+                                String(packet.second, Charsets.UTF_8)
+                            )
+                        }
                     }
                 }
             } catch (e: Exception) {
                 // Caiu no meio: o finally avisa.
             } finally {
-                clientConnected = false
-                clientOut = null
                 try {
                     socket.close()
                 } catch (e: Exception) {
                 }
-                listener.onClientDisconnected()
+                if (isMic) {
+                    if (micSocket === socket) {
+                        micConnected = false
+                        micSocket = null
+                        listener.onMicDisconnected()
+                    }
+                } else {
+                    if (clientSocket === socket) {
+                        clientConnected = false
+                        clientOut = null
+                        clientSocket = null
+                        listener.onClientDisconnected()
+                    }
+                }
             }
         }.start()
     }
@@ -221,7 +274,7 @@ class RemoteClient(
     private var socket: Socket? = null
     private var out: DataOutputStream? = null
 
-    fun connect(ip: String, pairingCode: String) {
+    fun connect(ip: String, pairingCode: String, role: String = "") {
         Thread {
             try {
                 val created = Socket(ip, RemoteProtocol.PORT)
@@ -234,7 +287,12 @@ class RemoteClient(
                     BufferedOutputStream(created.getOutputStream())
                 )
                 out = output
-                RemoteProtocol.writeText(output, "AUTH $pairingCode")
+                val auth = if (role.isEmpty()) {
+                    "AUTH $pairingCode"
+                } else {
+                    "AUTH $pairingCode $role"
+                }
+                RemoteProtocol.writeText(output, auth)
                 val reply = RemoteProtocol.readPacket(input)
                 val replyText = reply?.let {
                     if (it.first == RemoteProtocol.TYPE_TEXT) {
@@ -289,6 +347,28 @@ class RemoteClient(
         val output = out ?: return
         try {
             RemoteProtocol.writeText(output, "CMD $command")
+        } catch (e: Exception) {
+            // A thread de leitura avisa a queda.
+        }
+    }
+
+    /** Texto puro, sem prefixo (ex.: o HELLO da lapela). */
+    fun sendRawText(text: String) {
+        val output = out ?: return
+        try {
+            RemoteProtocol.writeText(output, text)
+        } catch (e: Exception) {
+            // A thread de leitura avisa a queda.
+        }
+    }
+
+    /** Etapa 4: trecho de audio PCM da lapela para a camera. */
+    fun sendAudio(pcm: ByteArray) {
+        val output = out ?: return
+        try {
+            RemoteProtocol.writePacket(
+                output, RemoteProtocol.TYPE_AUDIO, pcm
+            )
         } catch (e: Exception) {
             // A thread de leitura avisa a queda.
         }

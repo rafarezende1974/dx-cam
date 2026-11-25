@@ -31,6 +31,7 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.os.StatFs
 import android.os.SystemClock
+import android.content.ContentValues
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.Size
@@ -50,6 +51,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.MediaController
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
@@ -60,6 +62,8 @@ import androidx.core.content.ContextCompat
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.ln
 import kotlin.math.roundToInt
@@ -182,6 +186,26 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     private lateinit var ctlZoomVal: TextView
     private var ctlFields: Map<String, String> = emptyMap()
 
+    // v2 Etapa 4: lapela (recepcao na camera e este aparelho como mic).
+    private var micRxWriter: WavTempWriter? = null
+    private var micRxName: String = ""
+
+    @Volatile
+    private var micPeakDb: Float = -60f
+    private lateinit var lapelView: LinearLayout
+    private lateinit var lapelIp: EditText
+    private lateinit var lapelCode: EditText
+    private lateinit var lapelStatus: TextView
+    private lateinit var lapelLevel: ProgressBar
+    private lateinit var lapelTime: TextView
+    private lateinit var lapelToggle: Button
+    private var lapelClient: RemoteClient? = null
+    private var lapelCapture: MicCapture? = null
+    private var lapelWriter: WavTempWriter? = null
+    private var lapelBase: String = ""
+    private var lapelStartedAt: Long = 0
+    private var lapelTick: Runnable? = null
+
     private val cellValues = mutableMapOf<Control, TextView>()
     private val cellNames = mutableMapOf<Control, TextView>()
     private var selected: Control? = null
@@ -252,6 +276,9 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     override fun onDestroy() {
         stopHudTick()
         stopRemoteStateTick()
+        stopLapelTick()
+        lapelCapture?.stop()
+        lapelClient?.close()
         remoteServer?.stop()
         remoteClient?.close()
         engine.close()
@@ -563,6 +590,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         buildSettingsView()
         buildViewerView()
         buildControllerView()
+        buildLapelView()
         setContentView(rootFrame)
         refreshModeUi()
         refreshHud()
@@ -1683,6 +1711,34 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 override fun onCommand(text: String) {
                     uiHandler.post { handleRemoteCommand(text) }
                 }
+
+                override fun onMicConnected() {
+                    uiHandler.post {
+                        showStatus("Lapela conectada: recebendo o audio.")
+                        if (currentTab == TabKind.SETTINGS) buildSettings()
+                    }
+                }
+
+                override fun onMicDisconnected() {
+                    uiHandler.post {
+                        finishMicRx()
+                        showStatus("Lapela desconectou.")
+                        if (currentTab == TabKind.SETTINGS) buildSettings()
+                    }
+                }
+
+                override fun onMicText(text: String) {
+                    if (text.startsWith("HELLO ")) {
+                        val base = text.removePrefix("HELLO ").trim()
+                        uiHandler.post { startMicRx(base) }
+                    }
+                }
+
+                override fun onAudio(pcm: ByteArray) {
+                    micRxWriter?.write(pcm, pcm.size)
+                    val peak = LapelFormat.peakDb(pcm, pcm.size)
+                    if (peak > micPeakDb) micPeakDb = peak
+                }
             }
         )
         remoteServer = created
@@ -1798,11 +1854,315 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             }} " +
             "fd=$focusMeters " +
             "ev=${String.format(Locale.US, "%.1f", state.ev)} " +
-            "zm=${String.format(Locale.US, "%.1f", state.zoomRatio)}"
+            "zm=${String.format(Locale.US, "%.1f", state.zoomRatio)} " +
+            "mic=${if (remoteServer?.micConnected == true) 1 else 0} " +
+            "mlvl=${micPeakDb.roundToInt()}"
     }
 
     private fun sendRemoteState() {
         remoteServer?.sendText(remoteStateLine())
+        micPeakDb = -60f
+    }
+
+    // ---------------------------------------------------------------
+    // v2 Etapa 4: lapela sem fio (recepcao na camera + modo microfone)
+    // ---------------------------------------------------------------
+    private fun openAudioOutput(name: String): java.io.OutputStream? {
+        return try {
+            if (state.destSsd && state.treeUri.isNotEmpty()) {
+                val treeUri = Uri.parse(state.treeUri)
+                val parent = DocumentsContract.buildDocumentUriUsingTree(
+                    treeUri, DocumentsContract.getTreeDocumentId(treeUri)
+                )
+                val docUri = DocumentsContract.createDocument(
+                    contentResolver, parent, "audio/x-wav", name
+                ) ?: return null
+                contentResolver.openOutputStream(docUri)
+            } else {
+                val values = ContentValues().apply {
+                    put(MediaStore.Audio.Media.DISPLAY_NAME, name)
+                    put(MediaStore.Audio.Media.MIME_TYPE, "audio/x-wav")
+                    put(
+                        MediaStore.Audio.Media.RELATIVE_PATH,
+                        "Music/DXCam"
+                    )
+                }
+                val uri = contentResolver.insert(
+                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values
+                ) ?: return null
+                contentResolver.openOutputStream(uri)
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun copyWavToDestination(tempFile: File, name: String): Boolean {
+        val out = openAudioOutput(name) ?: return false
+        return try {
+            FileInputStream(tempFile).use { input ->
+                out.use { output -> input.copyTo(output) }
+            }
+            tempFile.delete()
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun startMicRx(base: String) {
+        finishMicRx()
+        micRxName = base + "_rx.wav"
+        micRxWriter = try {
+            WavTempWriter(cacheDir, base + "_rx")
+        } catch (e: Exception) {
+            null
+        }
+        showStatus("Lapela transmitindo: gravando $micRxName neste aparelho.")
+    }
+
+    private fun finishMicRx() {
+        val writer = micRxWriter ?: return
+        micRxWriter = null
+        val name = micRxName
+        Thread {
+            val file = writer.finish()
+            val ok = copyWavToDestination(file, name)
+            uiHandler.post {
+                showStatus(
+                    if (ok) {
+                        "Audio da lapela salvo: $name"
+                    } else {
+                        "Falhou ao salvar o audio da lapela ($name)."
+                    }
+                )
+            }
+        }.start()
+    }
+
+    private fun buildLapelView() {
+        lapelView = LinearLayout(this)
+        lapelView.orientation = LinearLayout.VERTICAL
+        lapelView.setBackgroundColor(0xFF0B1220.toInt())
+        lapelView.setPadding(dp(12), dp(10), dp(12), dp(10))
+        lapelView.visibility = View.GONE
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.HORIZONTAL
+        header.gravity = Gravity.CENTER_VERTICAL
+        val title = label(
+            "MICROFONE LAPELA — DX Cam", 14f, Color.WHITE, bold = true
+        )
+        header.addView(
+            title,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val closeButton = smallButton("FECHAR")
+        closeButton.setOnClickListener {
+            stopLapel()
+            lapelView.visibility = View.GONE
+        }
+        header.addView(closeButton)
+        lapelView.addView(header)
+        val hint = label(
+            "Este aparelho vai no bolso de quem fala: ele grava o WAV " +
+                "local (seguranca) e envia o audio ao vivo para a camera. " +
+                "Os dois na mesma rede Wi-Fi; a camera precisa estar " +
+                "armada (Configuracoes → Vinculo Remoto).",
+            11.5f, MUTED
+        )
+        hint.setPadding(0, dp(6), 0, dp(6))
+        lapelView.addView(hint)
+        val connectRow = LinearLayout(this)
+        connectRow.orientation = LinearLayout.HORIZONTAL
+        connectRow.gravity = Gravity.CENTER_VERTICAL
+        lapelIp = EditText(this)
+        lapelIp.hint = "IP da camera"
+        lapelIp.setText(state.lastRemoteIp)
+        lapelIp.setTextColor(Color.WHITE)
+        lapelIp.setHintTextColor(MUTED)
+        connectRow.addView(
+            lapelIp,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        lapelCode = EditText(this)
+        lapelCode.hint = "Codigo"
+        lapelCode.setTextColor(Color.WHITE)
+        lapelCode.setHintTextColor(MUTED)
+        lapelCode.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        val codeParams = LinearLayout.LayoutParams(
+            dp(90), ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        codeParams.leftMargin = dp(6)
+        connectRow.addView(lapelCode, codeParams)
+        lapelView.addView(connectRow)
+        lapelToggle = Button(this)
+        lapelToggle.text = "CONECTAR E GRAVAR"
+        lapelToggle.setOnClickListener { toggleLapel() }
+        val toggleParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(52)
+        )
+        toggleParams.topMargin = dp(8)
+        lapelView.addView(lapelToggle, toggleParams)
+        lapelLevel = ProgressBar(
+            this, null, android.R.attr.progressBarStyleHorizontal
+        )
+        lapelLevel.max = 100
+        lapelLevel.progress = 0
+        val levelParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(16)
+        )
+        levelParams.topMargin = dp(12)
+        lapelView.addView(lapelLevel, levelParams)
+        lapelTime = label("00:00", 20f, Color.WHITE, bold = true)
+        lapelTime.gravity = Gravity.CENTER
+        lapelTime.setPadding(0, dp(8), 0, 0)
+        lapelView.addView(lapelTime)
+        lapelStatus = label("Sem conexao.", 12f, MUTED)
+        lapelStatus.setPadding(0, dp(6), 0, 0)
+        lapelView.addView(lapelStatus)
+        rootFrame.addView(lapelView, overlayParams())
+    }
+
+    private fun openLapel() {
+        if (engine.recording) {
+            showStatus("Termine a gravacao para abrir a lapela.")
+            return
+        }
+        lapelView.visibility = View.VISIBLE
+    }
+
+    private fun toggleLapel() {
+        if (lapelClient != null) {
+            stopLapel()
+            return
+        }
+        val ip = lapelIp.text.toString().trim()
+        val code = lapelCode.text.toString().trim()
+        if (ip.isEmpty() || code.isEmpty()) {
+            showStatus("Digite o IP da camera e o codigo de pareamento.")
+            return
+        }
+        state.lastRemoteIp = ip
+        lapelBase = "DXLapela_" + SimpleDateFormat(
+            "yyyyMMdd_HHmmss", Locale.US
+        ).format(Date())
+        val client = RemoteClient(
+            object : RemoteClient.Listener {
+                override fun onConnected() {
+                    uiHandler.post { startLapelCapture() }
+                }
+
+                override fun onFrame(jpeg: ByteArray) {
+                }
+
+                override fun onText(text: String) {
+                }
+
+                override fun onDisconnected(message: String) {
+                    uiHandler.post { lapelDisconnected(message) }
+                }
+            }
+        )
+        lapelClient = client
+        lapelStatus.text = "Conectando em $ip..."
+        client.connect(ip, code, "MIC")
+    }
+
+    private fun startLapelCapture() {
+        val client = lapelClient ?: return
+        lapelWriter = try {
+            WavTempWriter(cacheDir, lapelBase)
+        } catch (e: Exception) {
+            null
+        }
+        val capture = MicCapture { chunk, _ ->
+            client.sendAudio(chunk)
+            lapelWriter?.write(chunk, chunk.size)
+            val peak = LapelFormat.peakDb(chunk, chunk.size)
+            uiHandler.post {
+                lapelLevel.progress =
+                    ((peak + 60f) / 60f * 100).toInt().coerceIn(0, 100)
+            }
+        }
+        if (!capture.start()) {
+            lapelStatus.text =
+                "O microfone nao abriu: confira a permissao de microfone " +
+                    "do DX Cam nas configuracoes do Android."
+            lapelWriter = null
+            client.close()
+            lapelClient = null
+            return
+        }
+        lapelCapture = capture
+        client.sendRawText("HELLO $lapelBase")
+        lapelStartedAt = System.currentTimeMillis()
+        lapelStatus.text =
+            "Transmitindo ao vivo e gravando local: $lapelBase.wav"
+        lapelToggle.text = "PARAR"
+        startLapelTick()
+    }
+
+    private fun startLapelTick() {
+        stopLapelTick()
+        val runnable = object : Runnable {
+            override fun run() {
+                val elapsed =
+                    (System.currentTimeMillis() - lapelStartedAt) / 1000
+                lapelTime.text = String.format(
+                    Locale.US, "%02d:%02d", elapsed / 60, elapsed % 60
+                )
+                uiHandler.postDelayed(this, 500)
+            }
+        }
+        lapelTick = runnable
+        uiHandler.post(runnable)
+    }
+
+    private fun stopLapelTick() {
+        lapelTick?.let { uiHandler.removeCallbacks(it) }
+        lapelTick = null
+    }
+
+    private fun finishLapelWav() {
+        val writer = lapelWriter ?: return
+        lapelWriter = null
+        val name = "$lapelBase.wav"
+        Thread {
+            val file = writer.finish()
+            val ok = copyWavToDestination(file, name)
+            uiHandler.post {
+                showStatus(
+                    if (ok) {
+                        "WAV da lapela salvo neste aparelho: $name"
+                    } else {
+                        "Falhou ao salvar o WAV da lapela ($name)."
+                    }
+                )
+            }
+        }.start()
+    }
+
+    private fun stopLapel() {
+        lapelCapture?.stop()
+        lapelCapture = null
+        lapelClient?.close()
+        lapelClient = null
+        finishLapelWav()
+        stopLapelTick()
+        lapelLevel.progress = 0
+        lapelToggle.text = "CONECTAR E GRAVAR"
+        lapelStatus.text = "Lapela parada."
+    }
+
+    private fun lapelDisconnected(message: String) {
+        lapelCapture?.stop()
+        lapelCapture = null
+        lapelClient = null
+        finishLapelWav()
+        stopLapelTick()
+        lapelLevel.progress = 0
+        lapelToggle.text = "CONECTAR E GRAVAR"
+        lapelStatus.text = message
     }
 
     private fun startRemoteStateTick() {
@@ -2179,11 +2539,17 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         controllerRemoteRecording = fields["rec"] == "1"
         controllerRec.text =
             if (controllerRemoteRecording) "■ PARAR" else "● REC"
+        val lapelInfo = if (fields["mic"] == "1") {
+            " · Lapela ON (${fields["mlvl"] ?: "-"} dB)"
+        } else {
+            ""
+        }
         controllerState.text =
             "Modo ${fields["modo"] ?: "-"} · ISO ${fields["iso"] ?: "-"} · " +
                 "Obturador ${fields["obt"] ?: "-"} · Bateria ${fields["bat"] ?: "-"} · " +
                 "Destino ${fields["dest"] ?: "-"} · " +
-                if (controllerRemoteRecording) "GRAVANDO" else "em espera"
+                (if (controllerRemoteRecording) "GRAVANDO" else "em espera") +
+                lapelInfo
         ctlIsoVal.text = if (fields["ia"] == "1") {
             "AUTO · lendo ${fields["iso"] ?: "-"}"
         } else {
@@ -2427,6 +2793,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         )
         controlParams.leftMargin = dp(8)
         remoteRow.addView(controlButton, controlParams)
+        val lapelRow = sRow()
+        val lapelButton = smallButton("MODO LAPELA (este aparelho vira microfone)")
+        lapelButton.setOnClickListener { openLapel() }
+        lapelRow.addView(lapelButton)
         val remoteInfo = label(
             if (armed) {
                 "Armada: IP ${localIpAddress()} · porta ${RemoteProtocol.PORT} · " +
@@ -2453,7 +2823,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "-"
         }
         val about = label(
-            "DX Cam v2.2.0-toque — DX Labs\n" +
+            "DX Cam v2.3.0-lapela — DX Labs\n" +
                 "Camera de cinema para o S24: video manual, foto RAW, " +
                 "monitoramento e LUT so na previa.\n" +
                 "Espaco livre no aparelho: $free.",
