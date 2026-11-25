@@ -1,6 +1,8 @@
 package br.com.dxlabs.dxcam
 
 import android.Manifest
+import android.app.AlertDialog
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Matrix
@@ -27,6 +29,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.SeekBar
@@ -56,6 +59,8 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     private lateinit var engine: CameraEngine
     private lateinit var textureView: TextureView
     private lateinit var modeButton: Button
+    private lateinit var bitrateButton: Button
+    private lateinit var destButton: Button
     private lateinit var spaceText: TextView
     private lateinit var timerText: TextView
     private lateinit var warningText: TextView
@@ -82,6 +87,26 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
             maybeOpenEngine()
+        }
+
+    private val treePickerLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri != null) {
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+                    state.treeUri = uri.toString()
+                    state.destSsd = true
+                    showStatus("Destino: pasta externa (SSD). Gravacoes vao para la.")
+                } catch (e: Exception) {
+                    showStatus("Nao consegui guardar o acesso a pasta: ${e.message}")
+                }
+                refreshTop()
+                updateSpace()
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -229,11 +254,33 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         topBar.addView(brand)
         modeButton = smallButton("")
         modeButton.setOnClickListener { cycleMode() }
+        modeButton.setOnLongClickListener {
+            editProjectPrefix()
+            true
+        }
         val modeParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         )
         modeParams.leftMargin = dp(12)
         topBar.addView(modeButton, modeParams)
+        bitrateButton = smallButton("")
+        bitrateButton.setOnClickListener { cycleBitrate() }
+        val bitrateParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        bitrateParams.leftMargin = dp(8)
+        topBar.addView(bitrateButton, bitrateParams)
+        destButton = smallButton("")
+        destButton.setOnClickListener { onDestTapped() }
+        destButton.setOnLongClickListener {
+            pickSsdFolder()
+            true
+        }
+        val destParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        destParams.leftMargin = dp(8)
+        topBar.addView(destButton, destParams)
         timerText = label("", 14f, RED, bold = true)
         timerText.typeface = Typeface.MONOSPACE
         timerText.visibility = View.GONE
@@ -765,7 +812,74 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     private fun refreshTop() {
         val mode = state.mode
         val codec = if (mode.hevc) "H.265" else "H.264"
-        modeButton.text = "${mode.label} · $codec · ${mode.bitrateMbps} Mbps"
+        modeButton.text =
+            "${mode.label} · $codec · ${state.effectiveBitrateMbps()} Mbps"
+        bitrateButton.text = state.bitrateLevelLabel()
+        destButton.text = if (state.destSsd) "SSD" else "INTERNO"
+    }
+
+    private fun cycleBitrate() {
+        if (engine.recording) {
+            showStatus("Bitrate so muda com a gravacao parada.")
+            return
+        }
+        state.bitrateLevel = (state.bitrateLevel + 1) % 3
+        showStatus(
+            "Bitrate ${state.bitrateLevelLabel()}: " +
+                "${state.effectiveBitrateMbps()} Mbps neste modo."
+        )
+        refreshTop()
+    }
+
+    private fun onDestTapped() {
+        if (engine.recording) {
+            showStatus("Destino so muda com a gravacao parada.")
+            return
+        }
+        if (state.treeUri.isEmpty()) {
+            pickSsdFolder()
+            return
+        }
+        state.destSsd = !state.destSsd
+        showStatus(
+            if (state.destSsd) "Destino: SSD (pasta escolhida)."
+            else "Destino: interno (Movies/DXCam)."
+        )
+        refreshTop()
+        updateSpace()
+    }
+
+    private fun pickSsdFolder() {
+        if (engine.recording) {
+            showStatus("Destino so muda com a gravacao parada.")
+            return
+        }
+        showStatus("Escolha a pasta do SSD onde os videos vao ser gravados.")
+        treePickerLauncher.launch(null)
+    }
+
+    private fun editProjectPrefix() {
+        val input = EditText(this)
+        input.setText(state.projectPrefix)
+        input.hint = "Ex.: EXPO2026, CASAMENTO_LIA"
+        AlertDialog.Builder(this)
+            .setTitle("Nome do projeto (entra no nome do arquivo)")
+            .setView(input)
+            .setPositiveButton("Salvar") { _, _ ->
+                val cleaned = input.text.toString().trim()
+                    .replace(Regex("[^A-Za-z0-9_-]"), "_")
+                    .take(24)
+                state.projectPrefix = cleaned
+                showStatus(
+                    if (cleaned.isEmpty()) {
+                        "Sem projeto: arquivos DXCam_data_hora.mp4."
+                    } else {
+                        "Projeto '$cleaned': arquivos DXCam_${cleaned}_data_hora.mp4."
+                    }
+                )
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
     }
 
     private fun refreshStrip() {
@@ -811,6 +925,13 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     }
 
     private fun updateSpace() {
+        if (state.destSsd) {
+            val granted = contentResolver.persistedUriPermissions.any {
+                it.uri.toString() == state.treeUri && it.isWritePermission
+            }
+            spaceText.text = if (granted) "SSD pronto" else "SSD: escolher pasta"
+            return
+        }
         try {
             val free = StatFs(Environment.getExternalStorageDirectory().path)
                 .availableBytes
@@ -917,15 +1038,28 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             if (recording) {
                 recButton.setTextColor(Color.WHITE)
                 recButton.text = "■"
-                showStatus("Gravando em Movies/DXCam.")
+                showStatus(
+                    if (state.destSsd) "Gravando no SSD." else "Gravando em Movies/DXCam."
+                )
                 startTimer()
             } else {
                 recButton.setTextColor(RED)
                 recButton.text = "●"
-                showStatus("Gravacao salva em Movies/DXCam.")
+                showStatus(
+                    if (state.destSsd) "Gravacao salva no SSD."
+                    else "Gravacao salva em Movies/DXCam."
+                )
                 stopTimer()
                 updateSpace()
             }
+        }
+    }
+
+    override fun onFileSplit(part: Int) {
+        uiHandler.post {
+            showStatus(
+                "Arquivo dividido sem perder quadros: parte $part gravando."
+            )
         }
     }
 

@@ -21,6 +21,7 @@ import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Handler
 import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.Range
 import android.util.Rational
@@ -32,14 +33,19 @@ import java.util.Locale
 import java.util.concurrent.Executor
 
 /**
- * DX Cam v1 - nucleo de camera (Etapa 2).
+ * DX Cam v1 - nucleo de camera (Etapas 2 e 3).
  *
- * Dono da sessao Camera2: previa em tela cheia, pedido de captura montado
- * a partir do CamState (manuais travaveis) e gravacao basica para
- * Movies/DXCam pelo MediaStore - o caminho provado na Fase 0, incluindo
- * a sessao HDR 10-bit (perfil HLG10 -> arquivo BT.2020/PQ no S24).
- * Destinos extras (SSD), niveis de bitrate e nomeacao avancada sao a
- * Etapa 3; monitoramento e a Etapa 4.
+ * Sessao Camera2 com previa, pedido montado do CamState (manuais
+ * travaveis) e gravacao completa:
+ * - Destinos: interno (Movies/DXCam via MediaStore) ou pasta externa
+ *   escolhida pelo usuario (SSD via SAF, permissao persistente).
+ * - Bitrate em tres niveis (ECO/PADRAO/ALTO) sobre a base do modo.
+ * - Nomeacao: DXCam[_projeto]_AAAAMMDD_HHMMSS[_parteN].mp4.
+ * - Divisao automatica: ao aproximar de ~3,8 GB o gravador emenda o
+ *   proximo arquivo sem perder quadros (setNextOutputFile), entao
+ *   gravacao longa nao estoura limite de sistema de arquivos.
+ * - HDR 10-bit pela sessao com perfil HLG10 (provado na Fase 0).
+ * Monitoramento e a Etapa 4; LUT, a 5.
  */
 class CameraEngine(
     private val context: Context,
@@ -50,6 +56,7 @@ class CameraEngine(
     interface Listener {
         fun onReadback(readback: Readback)
         fun onRecordingChanged(recording: Boolean)
+        fun onFileSplit(part: Int)
         fun onError(message: String)
     }
 
@@ -58,6 +65,14 @@ class CameraEngine(
         val exposureNs: Long?,
         val focusDiopters: Float?,
         val awbMode: Int?
+    )
+
+    /** Um arquivo de saida aberto (interno ou SSD), com seu fechamento. */
+    private class OutputHandle(
+        val name: String,
+        val pfd: ParcelFileDescriptor,
+        val finalize: () -> Unit,
+        val delete: () -> Unit
     )
 
     private val manager = context.getSystemService(CameraManager::class.java)
@@ -70,8 +85,11 @@ class CameraEngine(
     private var previewSurface: Surface? = null
 
     private var recorder: MediaRecorder? = null
-    private var recordUri: Uri? = null
-    private var recordPfd: ParcelFileDescriptor? = null
+    private val outputs = mutableListOf<OutputHandle>()
+    private var currentOutput: OutputHandle? = null
+    private var nextOutput: OutputHandle? = null
+    private var recordBaseName: String = ""
+    private var partIndex: Int = 1
 
     @Volatile
     var recording: Boolean = false
@@ -80,15 +98,12 @@ class CameraEngine(
     @Volatile
     private var transitioning: Boolean = false
 
-    // Faixas reais do aparelho (lidas das caracteristicas).
     private var isoRange: Range<Int> = Range(25, 3200)
     private var evRange: Range<Int> = Range(-20, 20)
     private var evStep: Float = 0.1f
     private var sensorOrientation: Int = 90
     private var activeArray: Rect = Rect(0, 0, 4080, 3060)
 
-    // Ultimos valores automaticos lidos - viram o ponto de partida quando
-    // so um dos controles de exposicao esta manual.
     @Volatile
     private var lastIso: Int? = null
     @Volatile
@@ -98,6 +113,11 @@ class CameraEngine(
     private var touchRegion: MeteringRectangle? = null
 
     val isTransitioning: Boolean get() = transitioning
+
+    companion object {
+        /** Divisao automatica: ~3,8 GB por arquivo (abaixo do limite FAT32). */
+        const val SPLIT_BYTES: Long = 3_800_000_000L
+    }
 
     fun previewSize(): Size {
         val id = CameraProbe.pickMainBackCameraId(manager) ?: return Size(1920, 1080)
@@ -167,10 +187,10 @@ class CameraEngine(
         } catch (e: Exception) {
         }
         device = null
-        releaseRecorder(deleteOutput = false)
+        releaseRecorder()
+        cleanupOutputs(delete = false)
     }
 
-    /** Reaplica o estado atual no pedido repetido (sem reconstruir a sessao). */
     fun applyState() {
         val activeSession = session ?: return
         val dev = device ?: return
@@ -215,7 +235,8 @@ class CameraEngine(
                         listener.onRecordingChanged(true)
                     } catch (e: Exception) {
                         transitioning = false
-                        releaseRecorder(deleteOutput = true)
+                        releaseRecorder()
+                        cleanupOutputs(delete = true)
                         listener.onError("Falha ao gravar: ${e.message}")
                         createSession(null)
                     }
@@ -227,7 +248,8 @@ class CameraEngine(
             override fun onConfigureFailed(failed: CameraCaptureSession) {
                 transitioning = false
                 if (recorderSurface != null) {
-                    releaseRecorder(deleteOutput = true)
+                    releaseRecorder()
+                    cleanupOutputs(delete = true)
                     listener.onError("Sessao de gravacao nao configurada.")
                     createSession(null)
                 } else {
@@ -376,7 +398,6 @@ class CameraEngine(
         }
     }
 
-    /** Toque na previa: define a regiao de foco/fotometria e dispara o AF. */
     fun tapFocus(normalizedX: Float, normalizedY: Float) {
         if (state.focusMode == FocusMode.MANUAL) return
         val size = 200
@@ -392,10 +413,8 @@ class CameraEngine(
         val dev = device ?: return
         val activeSession = session ?: return
         try {
-            // 1) O pedido repetido passa a carregar a regiao tocada.
             val base = buildRequest(dev, currentTargets())
             activeSession.setRepeatingRequest(base, resultCallback, bgHandler)
-            // 2) Um disparo unico com o gatilho de AF sobre as mesmas chaves.
             val shot = dev.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
             for (target in currentTargets()) shot.addTarget(target)
             copyKeys(base, shot)
@@ -410,7 +429,6 @@ class CameraEngine(
     }
 
     private fun copyKeys(from: CaptureRequest, to: CaptureRequest.Builder) {
-        // Copia chave a chave as configuracoes relevantes do pedido base.
         fun <T> copy(key: CaptureRequest.Key<T>) {
             val value = from.get(key)
             if (value != null) to.set(key, value)
@@ -434,32 +452,100 @@ class CameraEngine(
     }
 
     // ---------------------------------------------------------------
-    // Gravacao basica (Movies/DXCam via MediaStore) - caminho da Fase 0
+    // Gravacao (Etapa 3): destinos, nomeacao e divisao automatica
     // ---------------------------------------------------------------
+    private fun buildBaseName(): String {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val prefix = state.projectPrefix.trim()
+        return if (prefix.isEmpty()) "DXCam_$stamp" else "DXCam_${prefix}_$stamp"
+    }
+
+    private fun partName(part: Int): String =
+        if (part <= 1) "$recordBaseName.mp4" else "${recordBaseName}_parte$part.mp4"
+
+    /** Cria o arquivo da parte [part] no destino atual (interno ou SSD). */
+    private fun createOutput(part: Int): OutputHandle? {
+        val resolver = context.contentResolver
+        val name = partName(part)
+        return try {
+            if (state.destSsd && state.treeUri.isNotEmpty()) {
+                val treeUri = Uri.parse(state.treeUri)
+                val parent = DocumentsContract.buildDocumentUriUsingTree(
+                    treeUri, DocumentsContract.getTreeDocumentId(treeUri)
+                )
+                val docUri = DocumentsContract.createDocument(
+                    resolver, parent, "video/mp4", name
+                ) ?: return null
+                val pfd = resolver.openFileDescriptor(docUri, "w") ?: return null
+                OutputHandle(
+                    name = name,
+                    pfd = pfd,
+                    finalize = { /* SAF nao tem estado pendente */ },
+                    delete = {
+                        try {
+                            DocumentsContract.deleteDocument(resolver, docUri)
+                        } catch (e: Exception) {
+                        }
+                    }
+                )
+            } else {
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/DXCam")
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
+                val uri = resolver.insert(
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
+                ) ?: return null
+                val pfd = resolver.openFileDescriptor(uri, "w") ?: return null
+                OutputHandle(
+                    name = name,
+                    pfd = pfd,
+                    finalize = {
+                        try {
+                            val done = ContentValues().apply {
+                                put(MediaStore.Video.Media.IS_PENDING, 0)
+                            }
+                            resolver.update(uri, done, null, null)
+                        } catch (e: Exception) {
+                        }
+                    },
+                    delete = {
+                        try {
+                            resolver.delete(uri, null, null)
+                        } catch (e: Exception) {
+                        }
+                    }
+                )
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     fun startRecording() {
         if (recording || transitioning) return
         val mode = state.mode
         transitioning = true
-        val resolver = context.contentResolver
-        val name = "DXCam_" +
-            SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, name)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/DXCam")
-            put(MediaStore.Video.Media.IS_PENDING, 1)
-        }
-        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-        if (uri == null) {
+        recordBaseName = buildBaseName()
+        partIndex = 1
+        val first = createOutput(1)
+        if (first == null) {
             transitioning = false
-            listener.onError("Nao foi possivel criar o arquivo de video.")
+            listener.onError(
+                if (state.destSsd) {
+                    "Nao consegui criar o arquivo no SSD. Confira a pasta " +
+                        "(toque longo em SSD para escolher de novo)."
+                } else {
+                    "Nao foi possivel criar o arquivo de video."
+                }
+            )
             return
         }
-        recordUri = uri
+        currentOutput = first
+        outputs.add(first)
         try {
-            val pfd = resolver.openFileDescriptor(uri, "w")
-                ?: throw IllegalStateException("sem descritor de arquivo")
-            recordPfd = pfd
             val rec = MediaRecorder(context)
             recorder = rec
             rec.setAudioSource(MediaRecorder.AudioSource.MIC)
@@ -474,17 +560,56 @@ class CameraEngine(
             )
             rec.setVideoSize(mode.width, mode.height)
             rec.setVideoFrameRate(mode.fps)
-            rec.setVideoEncodingBitRate(mode.bitrateMbps * 1_000_000)
+            rec.setVideoEncodingBitRate(state.effectiveBitrateMbps() * 1_000_000)
             rec.setOrientationHint(sensorOrientation)
-            rec.setOutputFile(pfd.fileDescriptor)
+            rec.setOutputFile(first.pfd.fileDescriptor)
+            rec.setMaxFileSize(SPLIT_BYTES)
+            rec.setOnInfoListener({ _, what, _ ->
+                onRecorderInfo(what)
+            }, bgHandler)
             rec.prepare()
         } catch (e: Exception) {
             transitioning = false
-            releaseRecorder(deleteOutput = true)
+            releaseRecorder()
+            cleanupOutputs(delete = true)
             listener.onError("Falha ao preparar a gravacao: ${e.message}")
             return
         }
         createSession(recorder?.surface)
+    }
+
+    private fun onRecorderInfo(what: Int) {
+        when (what) {
+            MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_APPROACHING -> {
+                if (nextOutput == null) {
+                    val next = createOutput(partIndex + 1)
+                    if (next != null) {
+                        try {
+                            recorder?.setNextOutputFile(next.pfd.fileDescriptor)
+                            nextOutput = next
+                            outputs.add(next)
+                        } catch (e: Exception) {
+                            next.delete()
+                            try {
+                                next.pfd.close()
+                            } catch (ignored: Exception) {
+                            }
+                        }
+                    }
+                }
+            }
+            MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED -> {
+                val finishedPart = currentOutput
+                finishedPart?.finalize()
+                val promoted = nextOutput
+                if (promoted != null) {
+                    currentOutput = promoted
+                    nextOutput = null
+                    partIndex += 1
+                    listener.onFileSplit(partIndex)
+                }
+            }
+        }
     }
 
     fun stopRecording() {
@@ -497,46 +622,47 @@ class CameraEngine(
         try {
             recorder?.stop()
         } catch (e: Exception) {
-            // Arquivo pode sair curto; o MediaStore finaliza mesmo assim.
+            // Arquivo pode sair curto; finaliza mesmo assim.
         }
-        releaseRecorder(deleteOutput = false)
-        finalizeRecordUri()
+        releaseRecorder()
+        // A parte que estava preparada mas nunca usada sai vazia: apaga.
+        nextOutput?.let { unused ->
+            unused.delete()
+            outputs.remove(unused)
+        }
+        nextOutput = null
+        currentOutput?.finalize()
+        for (handle in outputs) {
+            try {
+                handle.pfd.close()
+            } catch (e: Exception) {
+            }
+        }
+        outputs.clear()
+        currentOutput = null
         listener.onRecordingChanged(false)
         createSession(null)
     }
 
-    private fun releaseRecorder(deleteOutput: Boolean) {
+    private fun releaseRecorder() {
         try {
             recorder?.reset()
             recorder?.release()
         } catch (e: Exception) {
         }
         recorder = null
-        try {
-            recordPfd?.close()
-        } catch (e: Exception) {
-        }
-        recordPfd = null
-        if (deleteOutput) {
-            recordUri?.let {
-                try {
-                    context.contentResolver.delete(it, null, null)
-                } catch (e: Exception) {
-                }
-            }
-            recordUri = null
-        }
     }
 
-    private fun finalizeRecordUri() {
-        val uri = recordUri ?: return
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.IS_PENDING, 0)
+    private fun cleanupOutputs(delete: Boolean) {
+        for (handle in outputs) {
+            if (delete) handle.delete()
+            try {
+                handle.pfd.close()
+            } catch (e: Exception) {
+            }
         }
-        try {
-            context.contentResolver.update(uri, values, null, null)
-        } catch (e: Exception) {
-        }
-        recordUri = null
+        outputs.clear()
+        currentOutput = null
+        nextOutput = null
     }
 }

@@ -111,7 +111,33 @@ class CamState(context: Context) {
     var zoomRatio: Float = prefs.getFloat("zoomRatio", 1f)
         set(value) { field = value.coerceIn(0.6f, 10f); save() }
 
+    // Gravacao (Etapa 3): nivel de bitrate, destino e nomeacao.
+    var bitrateLevel: Int = prefs.getInt("bitrateLevel", 1) // 0 ECO, 1 PADRAO, 2 ALTO
+        set(value) { field = value.coerceIn(0, 2); save() }
+    var destSsd: Boolean = prefs.getBoolean("destSsd", false)
+        set(value) { field = value; save() }
+    var treeUri: String = prefs.getString("treeUri", "") ?: ""
+        set(value) { field = value; save() }
+    var projectPrefix: String = prefs.getString("projectPrefix", "") ?: ""
+        set(value) { field = value; save() }
+
     val mode: VideoMode get() = VideoModes.ALL[modeIndex]
+
+    /** Bitrate efetivo do modo atual conforme o nivel (sempre visivel). */
+    fun effectiveBitrateMbps(): Int {
+        val factor = when (bitrateLevel) {
+            0 -> 0.5
+            2 -> 1.6
+            else -> 1.0
+        }
+        return (mode.bitrateMbps * factor).roundToInt().coerceAtLeast(2)
+    }
+
+    fun bitrateLevelLabel(): String = when (bitrateLevel) {
+        0 -> "ECO"
+        2 -> "ALTO"
+        else -> "PADRÃO"
+    }
 
     private fun save() {
         prefs.edit()
@@ -133,6 +159,10 @@ class CamState(context: Context) {
             .putBoolean("focusLocked", focusLocked)
             .putFloat("ev", ev)
             .putFloat("zoomRatio", zoomRatio)
+            .putInt("bitrateLevel", bitrateLevel)
+            .putBoolean("destSsd", destSsd)
+            .putString("treeUri", treeUri)
+            .putString("projectPrefix", projectPrefix)
             .apply()
     }
 
