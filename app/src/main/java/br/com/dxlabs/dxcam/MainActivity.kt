@@ -70,7 +70,7 @@ import kotlin.math.roundToInt
 class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
     private enum class Control { ISO, SHUTTER, WB, FOCUS, EV, ZOOM }
-    private enum class PanelKind { NONE, PARAM, MODE, MONITOR, LUT }
+    private enum class PanelKind { NONE, PARAM, MODE, MONITOR, LUT, PHOTO }
 
     private lateinit var state: CamState
     private lateinit var engine: CameraEngine
@@ -117,6 +117,9 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     private var lutCacheAtlas: java.nio.ByteBuffer? = null
     private var lutCacheSize: Int = 0
     private lateinit var lutButton: LinearLayout
+
+    // Etapa 6 (foto): flash do obturador sobre o visor.
+    private lateinit var flashView: View
 
     private val cellValues = mutableMapOf<Control, TextView>()
     private val cellNames = mutableMapOf<Control, TextView>()
@@ -424,6 +427,18 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         reticle.background = reticleBg
         reticle.visibility = View.GONE
         stage.addView(reticle, FrameLayout.LayoutParams(dp(76), dp(76)))
+
+        // Etapa 6: flash do obturador (some/aparece num piscar).
+        flashView = View(this)
+        flashView.setBackgroundColor(Color.BLACK)
+        flashView.alpha = 0f
+        flashView.isClickable = false
+        stage.addView(
+            flashView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
 
         buildTopBar(stage)
         buildBottomHud(stage)
@@ -786,9 +801,12 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
         val spacer2 = View(this)
         rail.addView(spacer2, LinearLayout.LayoutParams(1, 0, 1f))
-        rail.addView(railButton("◯", "FOTO") {
-            showStatus("Foto (RAW+JPEG) chega na Etapa 6.")
-        })
+        val fotoButton = railButton("◯", "FOTO") { capturePhoto() }
+        fotoButton.setOnLongClickListener {
+            togglePhotoPanel()
+            true
+        }
+        rail.addView(fotoButton)
         lutButton = railButton("LUT", "LUT") { toggleLutPanel() }
         rail.addView(lutButton)
         levelButton = railButton("◎", "NÍVEL") {
@@ -1258,6 +1276,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             showLutPanel()
             return
         }
+        if (panelKind == PanelKind.PHOTO) {
+            showPhotoPanel()
+            return
+        }
         val control = selected ?: return
         val fps = state.mode.fps
         when (control) {
@@ -1505,6 +1527,82 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 )
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Etapa 6: foto (JPEG + RAW/DNG) com os controles da previa
+    // ---------------------------------------------------------------
+    private fun capturePhoto() {
+        if (engine.recording) {
+            showStatus("Foto so com a gravacao parada.")
+            return
+        }
+        flashView.animate().cancel()
+        flashView.animate()
+            .alpha(0.55f)
+            .setDuration(60)
+            .withEndAction {
+                flashView.animate().alpha(0f).setDuration(160).start()
+            }
+            .start()
+        engine.capturePhoto(displayRotationDegrees())
+    }
+
+    private fun displayRotationDegrees(): Int {
+        @Suppress("DEPRECATION")
+        val rotation = try {
+            display?.rotation ?: windowManager.defaultDisplay.rotation
+        } catch (e: Exception) {
+            android.view.Surface.ROTATION_90
+        }
+        return when (rotation) {
+            android.view.Surface.ROTATION_90 -> 90
+            android.view.Surface.ROTATION_180 -> 180
+            android.view.Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+    }
+
+    private fun togglePhotoPanel() {
+        panelKind = if (panelKind == PanelKind.PHOTO) PanelKind.NONE else PanelKind.PHOTO
+        selected = null
+        showPanel()
+        refreshHud()
+    }
+
+    private fun showPhotoPanel() {
+        panelTitle("FOTO — toque no FOTO dispara; segurar abre este painel")
+        val row = panelRow()
+        val options = listOf(
+            CameraEngine.PHOTO_RAW_JPEG to "RAW + JPEG",
+            CameraEngine.PHOTO_JPEG_ONLY to "SÓ JPEG",
+            CameraEngine.PHOTO_RAW_ONLY to "SÓ RAW (DNG)"
+        )
+        for ((format, labelText) in options) {
+            val chip = chipButton(labelText, state.photoFormat == format) {
+                state.photoFormat = format
+                showPanel()
+                showStatus(
+                    "Formato da foto: $labelText. Destino: " +
+                        if (state.destSsd) "SSD" else "Pictures/DXCam."
+                )
+            }
+            val chipParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            chipParams.rightMargin = dp(6)
+            row.addView(chip, chipParams)
+        }
+        val note = label(
+            "A foto usa os controles manuais da prévia (ISO, obturador, " +
+                "foco, branco e zoom). O DNG tem ~25 MB; o JPEG sai no " +
+                "mesmo tamanho do sensor RAW. O destino segue o do " +
+                "vídeo (INTERNO/SSD no painel do modo).",
+            12f, MUTED
+        )
+        note.setPadding(0, dp(6), 0, 0)
+        panel.addView(note)
     }
 
     // ---------------------------------------------------------------
@@ -2188,6 +2286,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 "Arquivo dividido sem perder quadros: parte $part gravando."
             )
         }
+    }
+
+    override fun onPhotoSaved(message: String) {
+        uiHandler.post { showStatus(message) }
     }
 
     override fun onError(message: String) {

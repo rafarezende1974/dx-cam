@@ -153,6 +153,10 @@ class CamState(context: Context) {
     fun lutPaths(): List<String> =
         lutFiles.split("\n").filter { it.isNotBlank() }
 
+    // Foto (Etapa 6): 0 = RAW+JPEG, 1 = so JPEG, 2 = so RAW.
+    var photoFormat: Int = prefs.getInt("photoFormat", 0)
+        set(value) { field = value.coerceIn(0, 2); save() }
+
     val mode: VideoMode get() = VideoModes.ALL[modeIndex]
 
     /** Bitrate efetivo do modo atual conforme o nivel (sempre visivel). */
@@ -206,6 +210,7 @@ class CamState(context: Context) {
             .putInt("lutIntensity", lutIntensity)
             .putString("lutFiles", lutFiles)
             .putInt("lutActive", lutActive)
+            .putInt("photoFormat", photoFormat)
             .apply()
     }
 

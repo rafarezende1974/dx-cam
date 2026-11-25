@@ -11,13 +11,17 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.DynamicRangeProfiles
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.media.ExifInterface
+import android.media.Image
 import android.media.ImageReader
 import android.media.MediaRecorder
 import android.net.Uri
@@ -29,6 +33,7 @@ import android.util.Range
 import android.util.Rational
 import android.util.Size
 import android.view.Surface
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -63,6 +68,8 @@ class CameraEngine(
         fun onInfo(message: String)
         /** Plano Y da previa (640x360, bytes compactos) para a Etapa 4. */
         fun onAnalysisFrame(y: ByteArray, width: Int, height: Int)
+        /** Etapa 6: foto salva (JPEG e/ou DNG) no destino atual. */
+        fun onPhotoSaved(message: String)
     }
 
     data class Readback(
@@ -94,6 +101,28 @@ class CameraEngine(
     private var analysisSurface: Surface? = null
     private var activeTargets: List<Surface> = emptyList()
     private var lastAnalysisAt: Long = 0
+
+    // Etapa 6: leitores de foto (JPEG + RAW) e o estado da captura.
+    private var jpegReader: ImageReader? = null
+    private var jpegSurface: Surface? = null
+    private var rawReader: ImageReader? = null
+    private var rawSurface: Surface? = null
+    private var repeatingTargets: List<Surface> = emptyList()
+    private var photoInSession: Boolean = false
+    private var pendingPhoto: PendingPhoto? = null
+
+    val rawSupported: Boolean get() = rawReader != null
+
+    private class PendingPhoto(
+        val baseName: String,
+        val wantJpeg: Boolean,
+        val wantRaw: Boolean,
+        val orientationDegrees: Int,
+        var result: TotalCaptureResult? = null,
+        var jpegBytes: ByteArray? = null,
+        var rawImage: Image? = null,
+        var done: Boolean = false
+    )
 
     /** A tela liga/desliga conforme zebra/peaking/histograma ativos. */
     @Volatile
@@ -132,6 +161,11 @@ class CameraEngine(
     companion object {
         /** Divisao automatica: ~3,8 GB por arquivo (abaixo do limite FAT32). */
         const val SPLIT_BYTES: Long = 3_800_000_000L
+
+        /** Formatos de foto (CamState.photoFormat). */
+        const val PHOTO_RAW_JPEG: Int = 0
+        const val PHOTO_JPEG_ONLY: Int = 1
+        const val PHOTO_RAW_ONLY: Int = 2
     }
 
     fun previewSize(): Size {
@@ -186,6 +220,52 @@ class CameraEngine(
             // Quadro ilegivel: descarta e segue (monitoramento nao pode
             // derrubar a camera).
         } finally {
+            try {
+                image.close()
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private val jpegImageListener = ImageReader.OnImageAvailableListener { reader ->
+        val image = try {
+            reader.acquireLatestImage()
+        } catch (e: Exception) {
+            null
+        } ?: return@OnImageAvailableListener
+        try {
+            val buffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            val pending = pendingPhoto
+            if (pending != null && pending.wantJpeg && !pending.done) {
+                pending.jpegBytes = bytes
+                tryFinishPhoto()
+            }
+        } catch (e: Exception) {
+            // Quadro ilegivel: o vigia da captura avisa e limpa.
+        } finally {
+            try {
+                image.close()
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private val rawImageListener = ImageReader.OnImageAvailableListener { reader ->
+        val image = try {
+            reader.acquireLatestImage()
+        } catch (e: Exception) {
+            null
+        } ?: return@OnImageAvailableListener
+        val pending = pendingPhoto
+        if (pending != null && pending.wantRaw && !pending.done &&
+            pending.rawImage == null
+        ) {
+            // O DNG precisa da imagem aberta ate o resultado chegar.
+            pending.rawImage = image
+            tryFinishPhoto()
+        } else {
             try {
                 image.close()
             } catch (e: Exception) {
@@ -254,6 +334,39 @@ class CameraEngine(
         sensorOrientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         activeArray = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             ?: Rect(0, 0, 4080, 3060)
+        // Etapa 6: leitores de foto nos maiores tamanhos (receita da
+        // Fase 0: JPEG no tamanho do RAW quando existe, senao o maior).
+        try {
+            val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val rawSizes = map?.getOutputSizes(ImageFormat.RAW_SENSOR).orEmpty()
+            val rawSize = rawSizes.maxByOrNull { it.width * it.height }
+            if (rawSize != null) {
+                val reader = ImageReader.newInstance(
+                    rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2
+                )
+                reader.setOnImageAvailableListener(rawImageListener, bgHandler)
+                rawReader = reader
+                rawSurface = reader.surface
+            }
+            val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG).orEmpty()
+            val jpegSize = jpegSizes.firstOrNull {
+                rawSize != null && it.width == rawSize.width && it.height == rawSize.height
+            } ?: jpegSizes.maxByOrNull { it.width * it.height }
+            if (jpegSize != null) {
+                val reader = ImageReader.newInstance(
+                    jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2
+                )
+                reader.setOnImageAvailableListener(jpegImageListener, bgHandler)
+                jpegReader = reader
+                jpegSurface = reader.surface
+            }
+        } catch (e: Exception) {
+            // Sem leitores de foto a camera segue; o botao FOTO avisa.
+            jpegReader = null
+            jpegSurface = null
+            rawReader = null
+            rawSurface = null
+        }
         try {
             manager.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(opened: CameraDevice) {
@@ -298,6 +411,22 @@ class CameraEngine(
         analysisReader = null
         analysisSurface = null
         activeTargets = emptyList()
+        repeatingTargets = emptyList()
+        photoInSession = false
+        try {
+            pendingPhoto?.rawImage?.close()
+        } catch (e: Exception) {
+        }
+        pendingPhoto = null
+        try {
+            jpegReader?.close()
+            rawReader?.close()
+        } catch (e: Exception) {
+        }
+        jpegReader = null
+        jpegSurface = null
+        rawReader = null
+        rawSurface = null
     }
 
     fun applyState() {
@@ -313,6 +442,7 @@ class CameraEngine(
     }
 
     private fun currentTargets(): List<Surface> {
+        if (repeatingTargets.isNotEmpty()) return repeatingTargets
         if (activeTargets.isNotEmpty()) return activeTargets
         val targets = mutableListOf<Surface>()
         previewSurface?.let { targets.add(it) }
@@ -320,20 +450,34 @@ class CameraEngine(
         return targets
     }
 
-    private fun createSession(recorderSurface: Surface?, withAnalysis: Boolean = true) {
+    private fun createSession(
+        recorderSurface: Surface?,
+        withAnalysis: Boolean = true,
+        withPhoto: Boolean = recorderSurface == null
+    ) {
         val dev = device ?: return
         val preview = previewSurface ?: return
         val targets = mutableListOf(preview)
         val analysis = analysisSurface
         if (withAnalysis && analysis != null) targets.add(analysis)
+        // As saidas de foto entram na sessao, mas NUNCA no pedido
+        // repetido (senao o JPEG/RAW receberiam video sem parar).
+        val photoTargets = mutableListOf<Surface>()
+        if (withPhoto) {
+            jpegSurface?.let { photoTargets.add(it) }
+            rawSurface?.let { photoTargets.add(it) }
+        }
+        targets.addAll(photoTargets)
         if (recorderSurface != null) targets.add(recorderSurface)
         activeTargets = targets
+        repeatingTargets = targets - photoTargets.toSet()
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(newSession: CameraCaptureSession) {
                 session = newSession
+                photoInSession = withPhoto && photoTargets.isNotEmpty()
                 try {
                     newSession.setRepeatingRequest(
-                        buildRequest(dev, targets), resultCallback, bgHandler
+                        buildRequest(dev, repeatingTargets), resultCallback, bgHandler
                     )
                 } catch (e: Exception) {
                     listener.onError("Falha ao iniciar a previa: ${e.message}")
@@ -368,6 +512,25 @@ class CameraEngine(
                             "(sessao cheia); medidores seguem ativos."
                     )
                     createSession(recorderSurface, withAnalysis = false)
+                    return
+                }
+                if (recorderSurface == null && withAnalysis && withPhoto) {
+                    // Previa + analise + JPEG + RAW nao coube: a foto
+                    // fica e o monitoramento de imagem pausa.
+                    listener.onInfo(
+                        "Monitoramento de imagem pausado (sessao cheia " +
+                            "com a foto); medidores seguem ativos."
+                    )
+                    createSession(null, withAnalysis = false, withPhoto = true)
+                    return
+                }
+                if (recorderSurface == null && withPhoto) {
+                    listener.onInfo("Foto indisponivel nesta sessao.")
+                    createSession(null, withAnalysis = withAnalysis, withPhoto = false)
+                    return
+                }
+                if (recorderSurface == null && withAnalysis) {
+                    createSession(null, withAnalysis = false, withPhoto = false)
                     return
                 }
                 transitioning = false
@@ -578,6 +741,239 @@ class CameraEngine(
         copy(CaptureRequest.COLOR_CORRECTION_TRANSFORM)
         copy(CaptureRequest.COLOR_CORRECTION_GAINS)
         copy(CaptureRequest.CONTROL_ZOOM_RATIO)
+    }
+
+    // ---------------------------------------------------------------
+    // Foto (Etapa 6): JPEG + RAW (DNG) com os controles da previa
+    // ---------------------------------------------------------------
+    fun capturePhoto(displayRotationDegrees: Int) {
+        if (recording || transitioning) {
+            listener.onInfo("Foto so com a gravacao parada.")
+            return
+        }
+        val dev = device
+        val activeSession = session
+        if (dev == null || activeSession == null) {
+            listener.onError("Camera ainda nao esta pronta.")
+            return
+        }
+        if (pendingPhoto != null) {
+            listener.onInfo("Aguarde a foto anterior salvar.")
+            return
+        }
+        if (!photoInSession) {
+            listener.onError("Foto indisponivel nesta sessao.")
+            return
+        }
+        var wantJpeg = state.photoFormat != PHOTO_RAW_ONLY
+        var wantRaw = state.photoFormat != PHOTO_JPEG_ONLY
+        if (wantRaw && rawReader == null) {
+            wantRaw = false
+            wantJpeg = true
+            listener.onInfo("Este aparelho nao expoe RAW; salvando so JPEG.")
+        }
+        val targets = mutableListOf<Surface>()
+        if (wantJpeg) jpegSurface?.let { targets.add(it) }
+        if (wantRaw) rawSurface?.let { targets.add(it) }
+        if (targets.isEmpty() || (wantJpeg && jpegSurface == null)) {
+            listener.onError("Nenhuma saida de foto disponivel.")
+            return
+        }
+        val orientation = (sensorOrientation - displayRotationDegrees + 360) % 360
+        val pending = PendingPhoto(
+            baseName = buildBaseName(),
+            wantJpeg = wantJpeg,
+            wantRaw = wantRaw,
+            orientationDegrees = orientation
+        )
+        pendingPhoto = pending
+        try {
+            val builder = dev.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            for (target in targets) builder.addTarget(target)
+            copyKeys(buildRequest(dev, targets), builder)
+            builder.set(CaptureRequest.JPEG_ORIENTATION, orientation)
+            builder.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+            activeSession.capture(
+                builder.build(),
+                object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(
+                        completedSession: CameraCaptureSession,
+                        request: CaptureRequest,
+                        result: TotalCaptureResult
+                    ) {
+                        if (pendingPhoto === pending) {
+                            pending.result = result
+                            tryFinishPhoto()
+                        }
+                    }
+
+                    override fun onCaptureFailed(
+                        failedSession: CameraCaptureSession,
+                        request: CaptureRequest,
+                        failure: CaptureFailure
+                    ) {
+                        if (pendingPhoto === pending) {
+                            pendingPhoto = null
+                            try {
+                                pending.rawImage?.close()
+                            } catch (e: Exception) {
+                            }
+                            listener.onError("A captura da foto falhou.")
+                        }
+                    }
+                },
+                bgHandler
+            )
+            bgHandler.postDelayed({
+                if (pendingPhoto === pending && !pending.done) {
+                    pendingPhoto = null
+                    try {
+                        pending.rawImage?.close()
+                    } catch (e: Exception) {
+                    }
+                    listener.onError("A foto nao completou a tempo; tente de novo.")
+                }
+            }, 6_000)
+        } catch (e: Exception) {
+            pendingPhoto = null
+            listener.onError("Falha ao fotografar: ${e.message}")
+        }
+    }
+
+    /** Salva quando JPEG, RAW e o resultado da captura ja chegaram. */
+    private fun tryFinishPhoto() {
+        val pending = pendingPhoto ?: return
+        if (pending.done) return
+        if (pending.wantJpeg && pending.jpegBytes == null) return
+        if (pending.wantRaw && (pending.rawImage == null || pending.result == null)) {
+            return
+        }
+        pending.done = true
+        pendingPhoto = null
+        val saved = mutableListOf<String>()
+        val created = mutableListOf<OutputHandle>()
+        try {
+            if (pending.wantJpeg) {
+                val out = createImageOutput(
+                    pending.baseName + ".jpg", "image/jpeg"
+                ) ?: throw IllegalStateException("sem destino para o JPEG")
+                created.add(out)
+                FileOutputStream(out.pfd.fileDescriptor).use { stream ->
+                    stream.write(pending.jpegBytes!!)
+                }
+                out.finalize()
+                try {
+                    out.pfd.close()
+                } catch (e: Exception) {
+                }
+                saved.add(out.name)
+            }
+            if (pending.wantRaw) {
+                val characteristics = chars
+                    ?: throw IllegalStateException("sem caracteristicas da camera")
+                val out = createImageOutput(
+                    pending.baseName + ".dng", "image/x-adobe-dng"
+                ) ?: throw IllegalStateException("sem destino para o DNG")
+                created.add(out)
+                DngCreator(characteristics, pending.result!!).use { dng ->
+                    dng.setOrientation(exifOrientation(pending.orientationDegrees))
+                    FileOutputStream(out.pfd.fileDescriptor).use { stream ->
+                        dng.writeImage(stream, pending.rawImage!!)
+                    }
+                }
+                out.finalize()
+                try {
+                    out.pfd.close()
+                } catch (e: Exception) {
+                }
+                saved.add(out.name)
+            }
+            listener.onPhotoSaved(
+                "Foto salva: " + saved.joinToString(" + ") +
+                    if (state.destSsd) " (SSD)" else " (Pictures/DXCam)"
+            )
+        } catch (e: Exception) {
+            for (handle in created) {
+                handle.delete()
+                try {
+                    handle.pfd.close()
+                } catch (ignored: Exception) {
+                }
+            }
+            listener.onError("Falha ao salvar a foto: ${e.message}")
+        } finally {
+            try {
+                pending.rawImage?.close()
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private fun exifOrientation(degrees: Int): Int = when (degrees) {
+        90 -> ExifInterface.ORIENTATION_ROTATE_90
+        180 -> ExifInterface.ORIENTATION_ROTATE_180
+        270 -> ExifInterface.ORIENTATION_ROTATE_270
+        else -> ExifInterface.ORIENTATION_NORMAL
+    }
+
+    /** Cria o arquivo de imagem no destino atual (interno ou SSD). */
+    private fun createImageOutput(name: String, mime: String): OutputHandle? {
+        val resolver = context.contentResolver
+        return try {
+            if (state.destSsd && state.treeUri.isNotEmpty()) {
+                val treeUri = Uri.parse(state.treeUri)
+                val parent = DocumentsContract.buildDocumentUriUsingTree(
+                    treeUri, DocumentsContract.getTreeDocumentId(treeUri)
+                )
+                val docUri = DocumentsContract.createDocument(
+                    resolver, parent, mime, name
+                ) ?: return null
+                val pfd = resolver.openFileDescriptor(docUri, "w") ?: return null
+                OutputHandle(
+                    name = name,
+                    pfd = pfd,
+                    finalize = { /* SAF nao tem estado pendente */ },
+                    delete = {
+                        try {
+                            DocumentsContract.deleteDocument(resolver, docUri)
+                        } catch (e: Exception) {
+                        }
+                    }
+                )
+            } else {
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                    put(MediaStore.Images.Media.MIME_TYPE, mime)
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/DXCam")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+                val uri = resolver.insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
+                ) ?: return null
+                val pfd = resolver.openFileDescriptor(uri, "w") ?: return null
+                OutputHandle(
+                    name = name,
+                    pfd = pfd,
+                    finalize = {
+                        try {
+                            val done = ContentValues().apply {
+                                put(MediaStore.Images.Media.IS_PENDING, 0)
+                            }
+                            resolver.update(uri, done, null, null)
+                        } catch (e: Exception) {
+                        }
+                    },
+                    delete = {
+                        try {
+                            resolver.delete(uri, null, null)
+                        } catch (e: Exception) {
+                        }
+                    }
+                )
+            }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     // ---------------------------------------------------------------
