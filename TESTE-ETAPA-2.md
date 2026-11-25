@@ -1,4 +1,6 @@
-# DX Cam — Teste da Etapa 2 (núcleo de câmera) — v0.2.0-core
+# DX Cam — Teste da Etapa 2 (núcleo de câmera) — v0.2.1-core
+
+> v0.2.1 corrige a prévia deitada da v0.2.0 (faltava a rotação da matriz conforme o sentido da paisagem), some com as barras do sistema (tela cheia) e troca o status para "Câmera pronta" quando o primeiro quadro chega. **Confira a prévia nos dois sentidos da paisagem** (virando o aparelho 180°).
 
 Build pelo GitHub Actions (artefato `dx-cam-diag-apk`). Como a assinatura de debug muda a cada build, **desinstale a versão anterior antes de instalar**.
 

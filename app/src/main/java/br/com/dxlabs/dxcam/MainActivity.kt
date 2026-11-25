@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -14,6 +15,7 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.os.StatFs
 import android.os.SystemClock
+import android.util.Size
 import android.util.TypedValue
 import android.view.GestureDetector
 import android.view.Gravity
@@ -72,6 +74,8 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
     private var surfaceReady = false
     private var engineOpened = false
+    private var previewSizeUsed: Size = Size(1920, 1080)
+    private var firstReadback = true
     private var recordStartMs: Long = 0
     private var timerRunnable: Runnable? = null
 
@@ -88,6 +92,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         state = CamState(this)
         engine = CameraEngine(this, bgHandler, state, this)
         buildUi()
+        applyImmersive()
         if (!hasPermissions()) {
             permissionLauncher.launch(
                 arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
@@ -100,6 +105,29 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         engine.close()
         bgThread.quitSafely()
         super.onDestroy()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) applyImmersive()
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Troca de sentido na paisagem (90 <-> 270): reaplica a rotacao.
+        textureView.post { adjustAspect() }
+    }
+
+    /** Tela cheia de verdade: some com as barras do sistema (visor de cinema). */
+    private fun applyImmersive() {
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                or View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            )
     }
 
     private fun hasPermissions(): Boolean =
@@ -115,6 +143,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         engineOpened = true
         val texture = textureView.surfaceTexture ?: return
         val size = engine.previewSize()
+        previewSizeUsed = size
         texture.setDefaultBufferSize(size.width, size.height)
         adjustAspect()
         engine.open(Surface(texture))
@@ -408,21 +437,40 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         }
     }
 
+    /**
+     * Transformacao da previa - receita do Camera2Basic (Google): o
+     * buffer da camera chega na orientacao do sensor (retrato), entao em
+     * paisagem a matriz precisa girar 90 graus conforme o sentido
+     * (ROTATION_90 ou ROTATION_270), senao a imagem aparece deitada,
+     * como nos prints da v0.2.0.
+     */
     private fun adjustAspect() {
         val width = textureView.width
         val height = textureView.height
         if (width == 0 || height == 0) return
-        val viewAspect = width.toFloat() / height
-        val streamAspect = 16f / 9f
-        var scaleX = 1f
-        var scaleY = 1f
-        if (viewAspect > streamAspect) {
-            scaleY = viewAspect / streamAspect
-        } else {
-            scaleX = streamAspect / viewAspect
-        }
+        val rotation = display?.rotation ?: Surface.ROTATION_0
         val matrix = Matrix()
-        matrix.setScale(scaleX, scaleY, width / 2f, height / 2f)
+        val viewRect = RectF(0f, 0f, width.toFloat(), height.toFloat())
+        val bufferRect = RectF(
+            0f, 0f,
+            previewSizeUsed.height.toFloat(), previewSizeUsed.width.toFloat()
+        )
+        val centerX = viewRect.centerX()
+        val centerY = viewRect.centerY()
+        if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
+            bufferRect.offset(
+                centerX - bufferRect.centerX(), centerY - bufferRect.centerY()
+            )
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            val scale = maxOf(
+                height.toFloat() / previewSizeUsed.height,
+                width.toFloat() / previewSizeUsed.width
+            )
+            matrix.postScale(scale, scale, centerX, centerY)
+            matrix.postRotate((90 * (rotation - 2)).toFloat(), centerX, centerY)
+        } else if (rotation == Surface.ROTATION_180) {
+            matrix.postRotate(180f, centerX, centerY)
+        }
         textureView.setTransform(matrix)
     }
 
@@ -856,6 +904,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     override fun onReadback(readback: CameraEngine.Readback) {
         uiHandler.post {
             lastReadback = readback
+            if (firstReadback) {
+                firstReadback = false
+                showStatus("Camera pronta. Toque num controle da faixa para ajustar.")
+            }
             refreshStrip()
         }
     }
