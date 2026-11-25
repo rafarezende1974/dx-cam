@@ -14,11 +14,12 @@ Tempo total: uns 10 minutos. Faça com o celular **fora da capinha grossa** e, s
 **Rode um teste por vez e espere o status voltar antes de tocar no próximo botão.** Se um teste travar, a v0.1.1 encerra sozinha em até ~55 s e registra no relatório em qual etapa travou — nesse caso, feche e reabra o app e rode só aquele teste de novo.
 
 1. **Diagnóstico automático** — ao abrir, o app já lê o aparelho e monta o relatório na tela. Confira se aparecem as câmeras traseiras com ISO, obturador e RAW.
-2. **Gravar teste 4K 24p H.265 (30 s)** — aponte para uma cena com luz variada (uma janela ajuda) e toque no botão. Não feche o app. Ao fim, a análise do arquivo entra no relatório.
-3. **Gravar teste 1080p 60p H.264 (30 s)** — mesma cena.
-4. **Foto RAW de teste** — aponte para a mesma cena e toque. O app salva `teste_foto.dng` e `teste_foto.jpg` na pasta do app.
-5. **Teste de escrita 128 MB** — rode **duas vezes**: uma sem nada conectado (só interno) e outra com o SSD plugado. Os dois resultados entram no relatório.
-6. **Salvar relatório** e depois **Compartilhar relatório (WhatsApp)** — envie o arquivo `.txt` para a conversa do DX Cam.
+2. **Gravar teste 4K 24p H.265 (30 s)** — aponte para uma cena com luz variada (uma janela ajuda) e toque no botão. Não feche o app. Na metade, o app trava os controles no manual (ISO 800, foco a 2 m) — a imagem pode mudar de brilho, é esperado. Ao fim, a análise do arquivo entra no relatório.
+3. **Gravar teste 1080p 60p H.264 (30 s)** — mesma cena, também com a metade manual.
+4. **Gravar teste 4K 24p H.265 10-BIT HLG (30 s)** — mesma cena. É o teste que decide como a v1 grava em 10 bits.
+5. **Foto RAW de teste** — já aprovado na v0.1.1; só rode de novo se quiser.
+6. **Teste de escrita 128 MB** — interno já aprovado; rode com o **SSD plugado** para fechar esse item.
+7. **Salvar relatório** e depois **Compartilhar relatório (WhatsApp)** — envie o arquivo `.txt` para a conversa do DX Cam.
 
 ## Depois, no computador (conferência do 10-bit e do RAW)
 

@@ -118,6 +118,21 @@ class MainActivity : ComponentActivity() {
                 done = { appendSection(it) }
             )
         })
+        root.addView(button("Gravar teste 4K 24p H.265 10-BIT HLG (30 s)") {
+            if (!ensurePermissions()) return@button
+            tester.recordTest(
+                label = "4k24_hevc_hlg10",
+                width = 3840, height = 2160, fps = 24,
+                videoEncoder = MediaRecorder.VideoEncoder.HEVC,
+                bitrateMbps = 50,
+                durationMs = 30_000,
+                outDir = videoDir(),
+                hlg = true,
+                manualSecondHalf = false,
+                status = { setStatus(it) },
+                done = { appendSection(it) }
+            )
+        })
         root.addView(button("Gravar teste 1080p 60p H.264 (30 s)") {
             if (!ensurePermissions()) return@button
             tester.recordTest(

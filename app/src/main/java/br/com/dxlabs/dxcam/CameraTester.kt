@@ -12,6 +12,11 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.ColorSpaceTransform
+import android.hardware.camera2.params.DynamicRangeProfiles
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RggbChannelVector
+import android.hardware.camera2.params.SessionConfiguration
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaExtractor
@@ -22,41 +27,41 @@ import android.os.BatteryManager
 import android.os.Handler
 import android.os.StatFs
 import android.os.storage.StorageManager
+import android.util.Range
+import android.util.Rational
 import android.view.Surface
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.util.Locale
+import java.util.concurrent.Executor
 
 /**
  * DX Cam - Fase 0: testes que abrem a camera e gravam de verdade.
  *
- * - recordTest: grava um clipe curto (30 s) e depois analisa o arquivo
- *   gerado (codec, cor, fps aproximado por contagem de amostras, bitrate
- *   real). E assim que a Fase 0 prova se o "10-bit" declarado sai no
- *   arquivo.
- * - captureRawTest: captura RAW (DNG) + JPEG com os mesmos tamanhos que a
- *   sonda leu e salva os dois arquivos para abrir no Lightroom/Premiere.
- * - writeSpeedTest: escreve 128 MB em cada volume (interno e SSD/cartao,
- *   se houver) e mede MB/s sustentado.
+ * v0.1.2-diag - o que o reteste da v0.1.1 ensinou e esta versao prova:
+ * 1) FPS: os dois clipes da v0.1.1 sairam com 877 quadros em 30 s
+ *    (~29,2 fps) tanto no teste de 24 fps quanto no de 60 fps. Causa: o
+ *    pedido de captura nao fixava CONTROL_AE_TARGET_FPS_RANGE, entao a
+ *    camera rodou na faixa padrao dela. Agora a faixa [fps, fps] vai no
+ *    pedido, como a v1 fara.
+ * 2) MANUAL EM VIDEO: na metade de cada gravacao padrao, o pedido troca
+ *    para manual travado (AE/AF/AWB desligados, ISO 800, obturador
+ *    1/(2*fps), foco a 2 m, ganhos de cor fixos) e o relatorio traz os
+ *    valores LIDOS do ultimo quadro (CaptureResult), nao so os pedidos.
+ * 3) 10-BIT: teste separado monta a sessao com o perfil de faixa
+ *    dinamica HLG10 na saida do gravador (API 33+). O clipe SDR da
+ *    v0.1.1 saiu BT.709/range limitado pelo caminho padrao do
+ *    MediaRecorder; este teste mostra se o arquivo sai BT.2020/HLG.
  *
- * v0.1.1-diag - correcao do travamento da v0.1.0: no S24, a sessao de
- * gravacao so com a superficie do MediaRecorder nunca chamou
- * onConfigured/onConfigureFailed, o teste ficou "ocupado" para sempre e
- * todos os outros testes responderam OCUPADO sem rodar. Correcoes:
- * 1) toda sessao agora tem tambem uma superficie de previa (ImageReader
- *    YUV 1280x720), como no app real, que sempre tera previa;
- * 2) cada teste tem um vigia (watchdog) armado desde o inicio: se travar
- *    em qualquer etapa, ele encerra, limpa tudo e registra no relatorio
- *    em qual etapa travou;
- * 3) nenhum caminho sai em silencio: erro, desconexao e excecao ao abrir
- *    a camera tambem viram secao do relatorio.
+ * A foto RAW e o teste de escrita sao os mesmos da v0.1.1 (aprovados).
  */
 class CameraTester(
     private val context: Context,
     private val bgHandler: Handler
 ) {
     private val manager = context.getSystemService(CameraManager::class.java)
+    private val bgExecutor = Executor { command -> bgHandler.post(command) }
 
     @Volatile
     var busy: Boolean = false
@@ -75,6 +80,20 @@ class CameraTester(
     private var activeTitle: String = ""
     private var activeDone: ((String) -> Unit)? = null
     private var watchdog: Runnable? = null
+
+    @Volatile
+    private var lastResult: TotalCaptureResult? = null
+    private var manualNote: String = ""
+
+    private val resultCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            completedSession: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            lastResult = result
+        }
+    }
 
     companion object {
         fun batterySnapshot(context: Context): String {
@@ -95,6 +114,8 @@ class CameraTester(
         stage = "iniciando"
         activeTitle = title
         activeDone = done
+        lastResult = null
+        manualNote = ""
         val runnable = Runnable {
             if (!finished) {
                 val text = "\n=== $activeTitle ===\n" +
@@ -164,7 +185,7 @@ class CameraTester(
     }
 
     // ---------------------------------------------------------------
-    // Teste de gravacao
+    // Teste de gravacao (padrao SDR ou 10-bit HLG)
     // ---------------------------------------------------------------
     @SuppressLint("MissingPermission")
     fun recordTest(
@@ -176,6 +197,8 @@ class CameraTester(
         bitrateMbps: Int,
         durationMs: Long,
         outDir: File,
+        hlg: Boolean = false,
+        manualSecondHalf: Boolean = true,
         status: (String) -> Unit,
         done: (String) -> Unit
     ) {
@@ -230,60 +253,86 @@ class CameraTester(
                     cameraDevice = device
                     stage = "configurando a sessao"
                     status("Camera aberta, configurando a sessao...")
-                    try {
-                        device.createCaptureSession(
-                            listOf(surface, preview.surface),
-                            object : CameraCaptureSession.StateCallback() {
-                                override fun onConfigured(newSession: CameraCaptureSession) {
-                                    session = newSession
-                                    stage = "gravando"
-                                    try {
-                                        val builder = device.createCaptureRequest(
-                                            CameraDevice.TEMPLATE_RECORD
-                                        )
-                                        builder.addTarget(surface)
-                                        builder.addTarget(preview.surface)
-                                        builder.set(
-                                            CaptureRequest.CONTROL_MODE,
-                                            CaptureRequest.CONTROL_MODE_AUTO
-                                        )
-                                        builder.set(
-                                            CaptureRequest.CONTROL_AF_MODE,
-                                            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
-                                        )
-                                        builder.set(
-                                            CaptureRequest.CONTROL_AE_MODE,
-                                            CaptureRequest.CONTROL_AE_MODE_ON
-                                        )
-                                        newSession.setRepeatingRequest(
-                                            builder.build(), null, bgHandler
-                                        )
-                                        rec.start()
-                                        status("Gravando $label... aguarde ${durationMs / 1000} s.")
-                                    } catch (e: Exception) {
-                                        finishTest(
-                                            "\n=== $title ===\nFALHA ao iniciar: ${e.message}"
-                                        )
-                                        return
-                                    }
-                                    bgHandler.postDelayed({
-                                        stopRecording(
-                                            title, file, width, height, fps,
-                                            bitrateMbps, batteryStart
-                                        )
-                                    }, durationMs)
-                                }
-
-                                override fun onConfigureFailed(
-                                    failedSession: CameraCaptureSession
-                                ) {
-                                    finishTest(
-                                        "\n=== $title ===\nFALHA: sessao nao configurada."
+                    val sessionCallback = object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(newSession: CameraCaptureSession) {
+                            session = newSession
+                            stage = "gravando"
+                            try {
+                                val builder =
+                                    device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                                builder.addTarget(surface)
+                                builder.addTarget(preview.surface)
+                                builder.set(
+                                    CaptureRequest.CONTROL_MODE,
+                                    CaptureRequest.CONTROL_MODE_AUTO
+                                )
+                                builder.set(
+                                    CaptureRequest.CONTROL_AF_MODE,
+                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                                )
+                                builder.set(
+                                    CaptureRequest.CONTROL_AE_MODE,
+                                    CaptureRequest.CONTROL_AE_MODE_ON
+                                )
+                                builder.set(
+                                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                    Range(fps, fps)
+                                )
+                                newSession.setRepeatingRequest(
+                                    builder.build(), resultCallback, bgHandler
+                                )
+                                rec.start()
+                                status("Gravando $label... aguarde ${durationMs / 1000} s.")
+                            } catch (e: Exception) {
+                                finishTest(
+                                    "\n=== $title ===\nFALHA ao iniciar: ${e.message}"
+                                )
+                                return
+                            }
+                            if (manualSecondHalf) {
+                                bgHandler.postDelayed({
+                                    if (!finished) switchToManual(
+                                        device, newSession, surface, preview.surface, fps, status
                                     )
-                                }
-                            },
-                            bgHandler
-                        )
+                                }, durationMs / 2)
+                            }
+                            bgHandler.postDelayed({
+                                stopRecording(
+                                    title, file, width, height, fps,
+                                    bitrateMbps, batteryStart
+                                )
+                            }, durationMs)
+                        }
+
+                        override fun onConfigureFailed(failedSession: CameraCaptureSession) {
+                            val extra = if (hlg) {
+                                " (sessao HLG10 recusada pelo aparelho - a v1 usaria " +
+                                    "MediaCodec para o 10-bit)"
+                            } else {
+                                ""
+                            }
+                            finishTest("\n=== $title ===\nFALHA: sessao nao configurada.$extra")
+                        }
+                    }
+                    try {
+                        if (hlg) {
+                            val outRecorder = OutputConfiguration(surface)
+                            outRecorder.setDynamicRangeProfile(DynamicRangeProfiles.HLG10)
+                            val outPreview = OutputConfiguration(preview.surface)
+                            val config = SessionConfiguration(
+                                SessionConfiguration.SESSION_REGULAR,
+                                listOf(outRecorder, outPreview),
+                                bgExecutor,
+                                sessionCallback
+                            )
+                            device.createCaptureSession(config)
+                        } else {
+                            device.createCaptureSession(
+                                listOf(surface, preview.surface),
+                                sessionCallback,
+                                bgHandler
+                            )
+                        }
                     } catch (e: Exception) {
                         finishTest("\n=== $title ===\nFALHA ao criar a sessao: ${e.message}")
                     }
@@ -299,6 +348,68 @@ class CameraTester(
             }, bgHandler)
         } catch (e: Exception) {
             finishTest("\n=== $title ===\nFALHA ao abrir a camera: ${e.message}")
+        }
+    }
+
+    /** Troca o pedido repetido para manual travado (prova de controle em video). */
+    private fun switchToManual(
+        device: CameraDevice,
+        activeSession: CameraCaptureSession,
+        recordSurface: Surface,
+        previewSurface: Surface,
+        fps: Int,
+        status: (String) -> Unit
+    ) {
+        try {
+            stage = "gravando (manual)"
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+            builder.addTarget(recordSurface)
+            builder.addTarget(previewSurface)
+            builder.set(
+                CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO
+            )
+            builder.set(
+                CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF
+            )
+            builder.set(
+                CaptureRequest.SENSOR_SENSITIVITY, 800
+            )
+            builder.set(
+                CaptureRequest.SENSOR_EXPOSURE_TIME, 1_000_000_000L / (2L * fps)
+            )
+            builder.set(
+                CaptureRequest.SENSOR_FRAME_DURATION, 1_000_000_000L / fps
+            )
+            builder.set(
+                CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF
+            )
+            builder.set(
+                CaptureRequest.LENS_FOCUS_DISTANCE, 0.5f // 0,5 dioptria = foco a 2 m
+            )
+            builder.set(
+                CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF
+            )
+            builder.set(
+                CaptureRequest.COLOR_CORRECTION_MODE,
+                CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX
+            )
+            val one = Rational(1, 1)
+            val zero = Rational(0, 1)
+            builder.set(
+                CaptureRequest.COLOR_CORRECTION_TRANSFORM,
+                ColorSpaceTransform(
+                    arrayOf(one, zero, zero, zero, one, zero, zero, zero, one)
+                )
+            )
+            builder.set(
+                CaptureRequest.COLOR_CORRECTION_GAINS,
+                RggbChannelVector(1.9f, 1.0f, 1.0f, 1.7f)
+            )
+            activeSession.setRepeatingRequest(builder.build(), resultCallback, bgHandler)
+            manualNote = "manual aplicado na metade da gravacao"
+            status("Metade manual: ISO 800, obturador 1/${2 * fps}, foco a 2 m, branco fixo.")
+        } catch (e: Exception) {
+            manualNote = "FALHA ao aplicar o manual: ${e.message}"
         }
     }
 
@@ -323,7 +434,6 @@ class CameraTester(
             stopError = e.message
         }
         val batteryEnd = batterySnapshot(context)
-        // analyzeRecording le o arquivo antes do finishTest limpar tudo.
         val text = analyzeRecording(
             title, file, width, height, fps, bitrateMbps,
             batteryStart, batteryEnd, stopError
@@ -348,6 +458,19 @@ class CameraTester(
         sb.appendLine("Pedido: ${reqWidth}x$reqHeight @ $reqFps fps, $reqBitrateMbps Mbps")
         sb.appendLine("Inicio: $batteryStart | Fim: $batteryEnd")
         if (stopError != null) sb.appendLine("Aviso ao parar: $stopError")
+        if (manualNote.isNotEmpty()) sb.appendLine("Controle manual: $manualNote")
+        val result = lastResult
+        if (result != null) {
+            val iso = result.get(TotalCaptureResult.SENSOR_SENSITIVITY)
+            val expNs = result.get(TotalCaptureResult.SENSOR_EXPOSURE_TIME)
+            val focus = result.get(TotalCaptureResult.LENS_FOCUS_DISTANCE)
+            val awb = result.get(TotalCaptureResult.CONTROL_AWB_MODE)
+            sb.appendLine(
+                "Ultimo quadro (lido do CaptureResult): ISO=$iso, " +
+                    "obturador=${expNs?.let { "1/${Math.round(1_000_000_000.0 / it)} s" } ?: "?"}, " +
+                    "foco=${focus ?: "?"} dioptrias, modo AWB=$awb (0=OFF/manual)"
+            )
+        }
         if (!file.exists() || file.length() == 0L) {
             sb.appendLine("Resultado: arquivo nao gerado ou vazio (${file.absolutePath})")
             return sb.toString()
@@ -356,6 +479,7 @@ class CameraTester(
         sb.appendLine(
             "Arquivo: ${file.name} - ${String.format(Locale.US, "%.1f", sizeMb)} MB"
         )
+        var durationSec = 0.0
         try {
             val retriever = MediaMetadataRetriever()
             retriever.setDataSource(file.absolutePath)
@@ -371,7 +495,7 @@ class CameraTester(
                 MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE
             )
             retriever.release()
-            val durationSec = durationMs / 1000.0
+            durationSec = durationMs / 1000.0
             sb.appendLine(
                 "Duracao real: ${String.format(Locale.US, "%.1f", durationSec)} s | " +
                     "resolucao no arquivo: ${w}x$h | " +
@@ -408,8 +532,8 @@ class CameraTester(
                         "colorTransfer=$colorTransfer colorRange=$colorRange"
                 )
                 sb.appendLine(
-                    "  (referencia: transfer 7=SMPTE170M/Rec601, 1=Rec709, 6=SMPTE240M; " +
-                        "faixas de cor completas no Premiere confirmam o 10-bit)"
+                    "  (Android: standard 1=BT.709, 6=BT.2020; transfer 3=SDR, 8=HLG, " +
+                        "7=PQ; range 2=limitado, 1=cheio. BT.2020+HLG/PQ = caminho 10-bit)"
                 )
                 extractor.selectTrack(i)
                 var samples = 0
@@ -420,7 +544,11 @@ class CameraTester(
                     samples++
                     if (!extractor.advance()) break
                 }
-                sb.appendLine("  Amostras (quadros) contadas: $samples")
+                val realFps = if (durationSec > 0) samples / durationSec else 0.0
+                sb.appendLine(
+                    "  Amostras (quadros) contadas: $samples " +
+                        "(fps real ~${String.format(Locale.US, "%.1f", realFps)}, pedido $reqFps)"
+                )
                 extractor.unselectTrack(i)
             }
             extractor.release()
@@ -432,7 +560,7 @@ class CameraTester(
     }
 
     // ---------------------------------------------------------------
-    // Teste de foto RAW (DNG) + JPEG
+    // Teste de foto RAW (DNG) + JPEG - igual ao da v0.1.1 (aprovado)
     // ---------------------------------------------------------------
     @SuppressLint("MissingPermission")
     fun captureRawTest(
@@ -642,7 +770,7 @@ class CameraTester(
     }
 
     // ---------------------------------------------------------------
-    // Teste de escrita (interno e volumes externos/SSD)
+    // Teste de escrita (interno e volumes externos/SSD) - igual ao aprovado
     // ---------------------------------------------------------------
     fun writeSpeedTest(done: (String) -> Unit) {
         val sb = StringBuilder()

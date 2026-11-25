@@ -6,9 +6,9 @@ App Android da DX Labs estilo Rabbit Cam / Blackmagic Camera: transforma o Galax
 - **Aparelho principal:** Galaxy S24 · **secundário:** Galaxy Tab S9+
 - **Plano da v1:** documento "Plano DX Cam v1" (documentos do DX Cam, fora deste repo)
 
-## Estado atual: Fase 0 (diagnóstico) — v0.1.1-diag
+## Estado atual: Fase 0 (diagnóstico) — v0.1.2-diag
 
-> v0.1.1 corrige o travamento da v0.1.0 no S24 (a sessão só com a superfície do gravador nunca configurava e o app ficava "ocupado" para sempre): sessões agora têm superfície de prévia, cada teste tem vigia com etapa registrada e nenhum erro sai em silêncio. Primeiro relatório (25/11/2026): sondas completas aprovadas; testes de gravação/RAW aguardando reteste nesta versão.
+> Histórico: v0.1.1 corrigiu o travamento da v0.1.0 no S24 (sessão só com a superfície do gravador nunca configurava). Reteste da v0.1.1 (25/11/2026): gravações estáveis e RAW aprovado (DNG de 25 MB), mas os dois clipes saíram a ~29,2 fps (877 quadros em 30 s) em vez de 24/60 — o pedido não fixava a faixa de fps — e o clipe 4K saiu SDR/BT.709 pelo caminho padrão. A v0.1.2 fixa `CONTROL_AE_TARGET_FPS_RANGE`, prova o controle manual em vídeo (trava ISO/obturador/foco/branco na metade e lê o CaptureResult) e testa a sessão 10-bit com perfil HLG10.
 
 Nenhuma tela da v1 é codada antes da Fase 0. Este app (`DX Cam Diag`) roda no S24 real e responde, com números, o que o aparelho entrega:
 
