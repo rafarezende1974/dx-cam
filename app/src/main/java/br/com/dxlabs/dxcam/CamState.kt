@@ -121,6 +121,10 @@ class CamState(context: Context) {
     var projectPrefix: String = prefs.getString("projectPrefix", "") ?: ""
         set(value) { field = value; save() }
 
+    // Visual (v0.4.0): grade de tercos sobre o visor.
+    var showGrid: Boolean = prefs.getBoolean("showGrid", false)
+        set(value) { field = value; save() }
+
     val mode: VideoMode get() = VideoModes.ALL[modeIndex]
 
     /** Bitrate efetivo do modo atual conforme o nivel (sempre visivel). */
@@ -163,6 +167,7 @@ class CamState(context: Context) {
             .putBoolean("destSsd", destSsd)
             .putString("treeUri", treeUri)
             .putString("projectPrefix", projectPrefix)
+            .putBoolean("showGrid", showGrid)
             .apply()
     }
 

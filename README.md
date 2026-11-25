@@ -38,3 +38,5 @@ Build via GitHub Actions, no padrão DX Labs (build local não é usado):
 - `app/src/main/java/br/com/dxlabs/dxcam/Probes.kt` — sondas de leitura (Camera2, encoders, áudio, armazenamento)
 - `app/src/main/java/br/com/dxlabs/dxcam/CameraTester.kt` — testes que abrem a câmera (gravação, RAW, escrita)
 - `app/src/main/java/br/com/dxlabs/dxcam/MainActivity.kt` — tela única do diagnóstico e o relatório
+
+> **v0.4.0-visual (25/11/2026):** Etapa 3 confirmada por ele no S24 ("funcionando perfeitamente"). Interface reconstruída no layout aprovado (linha Blackmagic Camera): parâmetros no topo (LENTE, FPS, OBTUR., ÍRIS, FOCO | timecode com quadros no centro | ISO, WB com selo A, TOM, selo do modo), painel de modo no selo/FPS (resolução, bitrate, destino e projeto da Etapa 3), HUD inferior com tempo de gravação restante estimado + bateria (centro) e lugares reservados para histograma e medidores de áudio (Etapa 4), régua lateral com GUIAS (grade de terços, já funcional), EV, REC grande, FOTO/LUT/NÍVEL (avisam suas etapas) e abas Câmera/Mídia/Configurações. Motor sem mudanças. Guia: `TESTE-VISUAL.md`.
