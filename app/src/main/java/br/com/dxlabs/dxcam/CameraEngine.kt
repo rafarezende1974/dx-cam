@@ -3,6 +3,7 @@ package br.com.dxlabs.dxcam
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
@@ -17,6 +18,7 @@ import android.hardware.camera2.params.DynamicRangeProfiles
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.media.ImageReader
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Handler
@@ -58,6 +60,9 @@ class CameraEngine(
         fun onRecordingChanged(recording: Boolean)
         fun onFileSplit(part: Int)
         fun onError(message: String)
+        fun onInfo(message: String)
+        /** Plano Y da previa (640x360, bytes compactos) para a Etapa 4. */
+        fun onAnalysisFrame(y: ByteArray, width: Int, height: Int)
     }
 
     data class Readback(
@@ -83,6 +88,16 @@ class CameraEngine(
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var previewSurface: Surface? = null
+
+    // Etapa 4: leitor YUV de baixa resolucao para o monitoramento.
+    private var analysisReader: ImageReader? = null
+    private var analysisSurface: Surface? = null
+    private var activeTargets: List<Surface> = emptyList()
+    private var lastAnalysisAt: Long = 0
+
+    /** A tela liga/desliga conforme zebra/peaking/histograma ativos. */
+    @Volatile
+    var monitoringEnabled: Boolean = true
 
     private var recorder: MediaRecorder? = null
     private val outputs = mutableListOf<OutputHandle>()
@@ -132,9 +147,77 @@ class CameraEngine(
             ?: Size(1920, 1080)
     }
 
+    /**
+     * Quadros YUV da previa para o monitoramento: no maximo ~8 por
+     * segundo e so com o monitoramento ligado; o resto e descartado.
+     * A copia do plano Y roda nesta thread (fundo), nunca na tela.
+     */
+    private val analysisListener = ImageReader.OnImageAvailableListener { reader ->
+        val image = try {
+            reader.acquireLatestImage()
+        } catch (e: Exception) {
+            null
+        } ?: return@OnImageAvailableListener
+        try {
+            val now = System.currentTimeMillis()
+            if (!monitoringEnabled || now - lastAnalysisAt < 120) return@OnImageAvailableListener
+            lastAnalysisAt = now
+            val width = image.width
+            val height = image.height
+            val plane = image.planes[0]
+            val buffer = plane.buffer
+            val rowStride = plane.rowStride
+            val pixelStride = plane.pixelStride
+            val out = ByteArray(width * height)
+            if (pixelStride == 1) {
+                for (r in 0 until height) {
+                    buffer.position(r * rowStride)
+                    buffer.get(out, r * width, width)
+                }
+            } else {
+                for (r in 0 until height) {
+                    for (c in 0 until width) {
+                        out[r * width + c] = buffer.get(r * rowStride + c * pixelStride)
+                    }
+                }
+            }
+            listener.onAnalysisFrame(out, width, height)
+        } catch (e: Exception) {
+            // Quadro ilegivel: descarta e segue (monitoramento nao pode
+            // derrubar a camera).
+        } finally {
+            try {
+                image.close()
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    /** Amplitude maxima do microfone desde a ultima chamada (gravando). */
+    fun currentMaxAmplitude(): Int {
+        if (!recording) return 0
+        return try {
+            recorder?.maxAmplitude ?: 0
+        } catch (e: Exception) {
+            0
+        }
+    }
+
     @SuppressLint("MissingPermission")
     fun open(surface: Surface) {
         previewSurface = surface
+        try {
+            val reader = ImageReader.newInstance(
+                640, 360, ImageFormat.YUV_420_888, 2
+            )
+            reader.setOnImageAvailableListener(analysisListener, bgHandler)
+            analysisReader = reader
+            analysisSurface = reader.surface
+        } catch (e: Exception) {
+            // Sem leitor de analise a camera segue normal, sem monitoramento.
+            analysisReader = null
+            analysisSurface = null
+        }
         val id = CameraProbe.pickMainBackCameraId(manager)
         if (id == null) {
             listener.onError("Sem camera traseira.")
@@ -189,6 +272,13 @@ class CameraEngine(
         device = null
         releaseRecorder()
         cleanupOutputs(delete = false)
+        try {
+            analysisReader?.close()
+        } catch (e: Exception) {
+        }
+        analysisReader = null
+        analysisSurface = null
+        activeTargets = emptyList()
     }
 
     fun applyState() {
@@ -204,17 +294,21 @@ class CameraEngine(
     }
 
     private fun currentTargets(): List<Surface> {
+        if (activeTargets.isNotEmpty()) return activeTargets
         val targets = mutableListOf<Surface>()
         previewSurface?.let { targets.add(it) }
         if (recording || transitioning) recorder?.surface?.let { targets.add(it) }
         return targets
     }
 
-    private fun createSession(recorderSurface: Surface?) {
+    private fun createSession(recorderSurface: Surface?, withAnalysis: Boolean = true) {
         val dev = device ?: return
         val preview = previewSurface ?: return
         val targets = mutableListOf(preview)
+        val analysis = analysisSurface
+        if (withAnalysis && analysis != null) targets.add(analysis)
         if (recorderSurface != null) targets.add(recorderSurface)
+        activeTargets = targets
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(newSession: CameraCaptureSession) {
                 session = newSession
@@ -246,6 +340,17 @@ class CameraEngine(
             }
 
             override fun onConfigureFailed(failed: CameraCaptureSession) {
+                if (recorderSurface != null && withAnalysis) {
+                    // Sessao cheia demais (previa + analise + 4K): tenta
+                    // de novo sem a analise. A gravacao manda; o
+                    // monitoramento de imagem pausa nesta gravacao.
+                    listener.onInfo(
+                        "Monitoramento de imagem pausado nesta gravacao " +
+                            "(sessao cheia); medidores seguem ativos."
+                    )
+                    createSession(recorderSurface, withAnalysis = false)
+                    return
+                }
                 transitioning = false
                 if (recorderSurface != null) {
                     releaseRecorder()
@@ -263,10 +368,15 @@ class CameraEngine(
             if (recorderSurface != null && state.mode.hdr) {
                 val outRecorder = OutputConfiguration(recorderSurface)
                 outRecorder.setDynamicRangeProfile(DynamicRangeProfiles.HLG10)
-                val outPreview = OutputConfiguration(preview)
+                val outputs = mutableListOf(
+                    outRecorder, OutputConfiguration(preview)
+                )
+                if (withAnalysis && analysis != null) {
+                    outputs.add(OutputConfiguration(analysis))
+                }
                 val config = SessionConfiguration(
                     SessionConfiguration.SESSION_REGULAR,
-                    listOf(outRecorder, outPreview),
+                    outputs,
                     bgExecutor,
                     callback
                 )

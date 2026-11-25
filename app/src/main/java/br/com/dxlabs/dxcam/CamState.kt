@@ -125,6 +125,20 @@ class CamState(context: Context) {
     var showGrid: Boolean = prefs.getBoolean("showGrid", false)
         set(value) { field = value; save() }
 
+    // Monitoramento (Etapa 4): o que esta ligado e o limiar da zebra.
+    var zebraOn: Boolean = prefs.getBoolean("zebraOn", true)
+        set(value) { field = value; save() }
+    var peakingOn: Boolean = prefs.getBoolean("peakingOn", false)
+        set(value) { field = value; save() }
+    var histoOn: Boolean = prefs.getBoolean("histoOn", true)
+        set(value) { field = value; save() }
+    var metersOn: Boolean = prefs.getBoolean("metersOn", true)
+        set(value) { field = value; save() }
+    var levelOn: Boolean = prefs.getBoolean("levelOn", false)
+        set(value) { field = value; save() }
+    var zebraIre: Int = prefs.getInt("zebraIre", 95)
+        set(value) { field = value.coerceIn(70, 100); save() }
+
     val mode: VideoMode get() = VideoModes.ALL[modeIndex]
 
     /** Bitrate efetivo do modo atual conforme o nivel (sempre visivel). */
@@ -168,6 +182,12 @@ class CamState(context: Context) {
             .putString("treeUri", treeUri)
             .putString("projectPrefix", projectPrefix)
             .putBoolean("showGrid", showGrid)
+            .putBoolean("zebraOn", zebraOn)
+            .putBoolean("peakingOn", peakingOn)
+            .putBoolean("histoOn", histoOn)
+            .putBoolean("metersOn", metersOn)
+            .putBoolean("levelOn", levelOn)
+            .putInt("zebraIre", zebraIre)
             .apply()
     }
 

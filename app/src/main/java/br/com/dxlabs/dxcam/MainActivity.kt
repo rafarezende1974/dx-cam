@@ -13,6 +13,10 @@ import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.os.BatteryManager
@@ -63,7 +67,7 @@ import kotlin.math.roundToInt
 class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
     private enum class Control { ISO, SHUTTER, WB, FOCUS, EV, ZOOM }
-    private enum class PanelKind { NONE, PARAM, MODE }
+    private enum class PanelKind { NONE, PARAM, MODE, MONITOR }
 
     private lateinit var state: CamState
     private lateinit var engine: CameraEngine
@@ -89,6 +93,17 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     private lateinit var panel: LinearLayout
     private lateinit var recCore: View
     private lateinit var gridButton: LinearLayout
+    private lateinit var levelButton: LinearLayout
+    private lateinit var overlayView: MonitorOverlay
+    private lateinit var histoView: HistogramView
+    private lateinit var histoNote: TextView
+    private lateinit var meterView1: MeterView
+    private lateinit var meterView2: MeterView
+
+    private val audioMeter = AudioMeter()
+    private var sensorManager: SensorManager? = null
+    private var meterTick: Runnable? = null
+    private var peakDb: Float = -60f
 
     private val cellValues = mutableMapOf<Control, TextView>()
     private val cellNames = mutableMapOf<Control, TextView>()
@@ -157,6 +172,20 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         engine.close()
         bgThread.quitSafely()
         super.onDestroy()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        startMeterTick()
+        if (state.levelOn) registerLevelSensor()
+        if (state.metersOn && !engine.recording) audioMeter.start()
+    }
+
+    override fun onPause() {
+        stopMeterTick()
+        unregisterLevelSensor()
+        audioMeter.stop()
+        super.onPause()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -357,6 +386,15 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             )
         )
 
+        // Etapa 4: zebra, peaking e nivel desenhados sobre o visor.
+        overlayView = MonitorOverlay(this)
+        stage.addView(
+            overlayView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+
         reticle = View(this)
         val reticleBg = GradientDrawable()
         reticleBg.shape = GradientDrawable.RECTANGLE
@@ -416,6 +454,8 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         refreshHud()
         refreshStorage()
         refreshGridButton()
+        updateMonitoringFlags()
+        refreshLevelButton()
     }
 
     private fun buildTopBar(stage: FrameLayout) {
@@ -551,7 +591,8 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         hudParams.gravity = Gravity.BOTTOM
         stage.addView(hud, hudParams)
 
-        // Esquerda: histograma (dado real e a Etapa 4; lugar reservado).
+        // Esquerda: histograma real (Etapa 4). Toque abre o painel de
+        // monitoramento (zebra, peaking, medidores e limiar).
         val histo = LinearLayout(this)
         histo.orientation = LinearLayout.VERTICAL
         histo.addView(label("Rec.709", 9f, MUTED))
@@ -561,7 +602,15 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         histoBg.setColor(0x33000000)
         histoBg.setStroke(dp(1), 0x66FFFFFF)
         histoBox.background = histoBg
-        val histoNote = label("histograma · Etapa 4", 8.5f, MUTED)
+        histoView = HistogramView(this)
+        histoBox.addView(
+            histoView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        histoNote = label("histograma desligado", 8.5f, MUTED)
         histoNote.gravity = Gravity.CENTER
         histoBox.addView(
             histoNote,
@@ -570,6 +619,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         )
+        histoBox.setOnClickListener { toggleMonitorPanel() }
         histo.addView(histoBox, LinearLayout.LayoutParams(dp(118), dp(38)))
         hud.addView(histo)
 
@@ -620,11 +670,15 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         freeRow.addView(remainFreeText)
         storage.addView(freeRow, freeRowParams)
 
-        // Direita: medidores de audio (dado real e a Etapa 4; lugar reservado).
+        // Direita: medidores de audio reais (Etapa 4). O microfone e
+        // mono: os dois canais mostram o mesmo nivel. Toque abre o
+        // painel de monitoramento.
         val meters = LinearLayout(this)
         meters.orientation = LinearLayout.VERTICAL
-        meters.addView(label("Padrão · áudio Etapa 4", 9f, MUTED))
-        for (channel in 1..2) {
+        meters.addView(label("Padrão", 9f, MUTED))
+        meterView1 = MeterView(this)
+        meterView2 = MeterView(this)
+        for ((channel, meterView) in listOf(1 to meterView1, 2 to meterView2)) {
             val row = LinearLayout(this)
             row.orientation = LinearLayout.HORIZONTAL
             row.gravity = Gravity.CENTER_VERTICAL
@@ -633,23 +687,9 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             )
             rowParams.topMargin = dp(3)
             row.addView(label(channel.toString(), 9f, MUTED))
-            val meterBar = LinearLayout(this)
-            meterBar.orientation = LinearLayout.HORIZONTAL
             val meterParams = LinearLayout.LayoutParams(dp(140), dp(8))
             meterParams.leftMargin = dp(5)
-            val green = View(this)
-            green.setBackgroundColor(0xFF25C33B.toInt())
-            val yellow = View(this)
-            yellow.setBackgroundColor(0xFFE8C51C.toInt())
-            val rest = View(this)
-            rest.setBackgroundColor(0x2EFFFFFF)
-            val red = View(this)
-            red.setBackgroundColor(0xFF7A2020.toInt())
-            meterBar.addView(green, LinearLayout.LayoutParams(0, dp(8), 52f))
-            meterBar.addView(yellow, LinearLayout.LayoutParams(0, dp(8), 9f))
-            meterBar.addView(rest, LinearLayout.LayoutParams(0, dp(8), 32f))
-            meterBar.addView(red, LinearLayout.LayoutParams(0, dp(8), 7f))
-            row.addView(meterBar, meterParams)
+            row.addView(meterView, meterParams)
             meters.addView(row, rowParams)
         }
         val scale = label("-45   -30   -20   -10   -6   -3   0   3", 7.5f, MUTED)
@@ -659,6 +699,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         scaleParams.leftMargin = dp(14)
         scaleParams.topMargin = dp(2)
         meters.addView(scale, scaleParams)
+        meters.setOnClickListener { toggleMonitorPanel() }
         hud.addView(meters)
     }
 
@@ -731,9 +772,15 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         rail.addView(railButton("LUT", "LUT") {
             showStatus("LUT .cube chega na Etapa 5.")
         })
-        rail.addView(railButton("◎", "NÍVEL") {
-            showStatus("Nivel e monitoramento completo chegam na Etapa 4.")
-        })
+        levelButton = railButton("◎", "NÍVEL") {
+            state.levelOn = !state.levelOn
+            applyLevelState()
+            showStatus(
+                if (state.levelOn) "Nivel ligado: alinhe a linha ao horizonte."
+                else "Nivel desligado."
+            )
+        }
+        rail.addView(levelButton)
     }
 
     private fun recCoreDrawable(recording: Boolean): GradientDrawable {
@@ -752,6 +799,118 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         gridButton.setBackgroundColor(
             if (state.showGrid) 0x33FFB300 else Color.TRANSPARENT
         )
+    }
+
+    private fun refreshLevelButton() {
+        levelButton.setBackgroundColor(
+            if (state.levelOn) 0x33FFB300 else Color.TRANSPARENT
+        )
+    }
+
+    // ---------------------------------------------------------------
+    // Etapa 4: nivel (sensor de rotacao), medidores e flags
+    // ---------------------------------------------------------------
+    private val rotationListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
+            val matrix = FloatArray(9)
+            SensorManager.getRotationMatrixFromVector(matrix, event.values)
+            val remapped = FloatArray(9)
+            when (display?.rotation ?: Surface.ROTATION_0) {
+                Surface.ROTATION_90 -> SensorManager.remapCoordinateSystem(
+                    matrix, SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X, remapped
+                )
+                Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(
+                    matrix, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remapped
+                )
+                else -> System.arraycopy(matrix, 0, remapped, 0, 9)
+            }
+            val orientation = FloatArray(3)
+            SensorManager.getOrientation(remapped, orientation)
+            val rollDeg = Math.toDegrees(orientation[2].toDouble()).toFloat()
+            overlayView.levelAngleDeg = -rollDeg
+            overlayView.invalidate()
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    private fun registerLevelSensor() {
+        if (sensorManager == null) {
+            sensorManager = getSystemService(SensorManager::class.java)
+        }
+        val sensor = sensorManager?.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+            ?: return
+        sensorManager?.registerListener(
+            rotationListener, sensor, SensorManager.SENSOR_DELAY_UI,
+            uiHandler
+        )
+    }
+
+    private fun unregisterLevelSensor() {
+        try {
+            sensorManager?.unregisterListener(rotationListener)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun applyLevelState() {
+        overlayView.showLevel = state.levelOn
+        overlayView.invalidate()
+        refreshLevelButton()
+        if (state.levelOn) registerLevelSensor() else unregisterLevelSensor()
+    }
+
+    private fun amplitudeToDb(amplitude: Int): Float {
+        if (amplitude <= 0) return -60f
+        return (20.0 * kotlin.math.log10(amplitude / 32767.0))
+            .toFloat().coerceIn(-60f, 0f)
+    }
+
+    private fun startMeterTick() {
+        stopMeterTick()
+        peakDb = -60f
+        val runnable = object : Runnable {
+            override fun run() {
+                val db = when {
+                    !state.metersOn -> -60f
+                    engine.recording -> amplitudeToDb(engine.currentMaxAmplitude())
+                    else -> audioMeter.currentDb
+                }
+                peakDb = if (db > peakDb) db else maxOf(db, peakDb - 0.3f)
+                meterView1.db = db
+                meterView1.peakDb = peakDb
+                meterView2.db = db
+                meterView2.peakDb = peakDb
+                meterView1.invalidate()
+                meterView2.invalidate()
+                meterTick = this
+                uiHandler.postDelayed(this, 100)
+            }
+        }
+        meterTick = runnable
+        uiHandler.post(runnable)
+    }
+
+    private fun stopMeterTick() {
+        meterTick?.let { uiHandler.removeCallbacks(it) }
+        meterTick = null
+    }
+
+    /** Liga/desliga os canais de monitoramento conforme o estado. */
+    private fun updateMonitoringFlags() {
+        engine.monitoringEnabled =
+            state.zebraOn || state.peakingOn || state.histoOn
+        overlayView.showZebra = state.zebraOn
+        overlayView.showPeaking = state.peakingOn
+        overlayView.showLevel = state.levelOn
+        overlayView.invalidate()
+        histoView.visibility = if (state.histoOn) View.VISIBLE else View.GONE
+        histoNote.visibility = if (state.histoOn) View.GONE else View.VISIBLE
+        if (!state.histoOn) {
+            histoView.bins = null
+            histoView.invalidate()
+        }
     }
 
     private fun buildTabs(rootRow: LinearLayout) {
@@ -970,6 +1129,62 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         refreshHud()
     }
 
+    private fun toggleMonitorPanel() {
+        panelKind =
+            if (panelKind == PanelKind.MONITOR) PanelKind.NONE else PanelKind.MONITOR
+        selected = null
+        showPanel()
+        refreshHud()
+    }
+
+    /** Painel da Etapa 4: ligas do monitoramento e limiar da zebra. */
+    private fun showMonitorPanel() {
+        panelTitle("MONITORAMENTO")
+        val row = panelRow()
+        val toggles = listOf(
+            Triple("ZEBRA", state.zebraOn) { state.zebraOn = !state.zebraOn },
+            Triple("PEAKING", state.peakingOn) { state.peakingOn = !state.peakingOn },
+            Triple("HISTOGRAMA", state.histoOn) { state.histoOn = !state.histoOn },
+            Triple("MEDIDORES", state.metersOn) { state.metersOn = !state.metersOn }
+        )
+        for ((name, isOn, toggle) in toggles) {
+            val chip = chipButton("$name: ${if (isOn) "LIGADO" else "DESLIGADO"}", isOn) {
+                toggle()
+                updateMonitoringFlags()
+                if (name == "MEDIDORES") {
+                    if (state.metersOn && !engine.recording) audioMeter.start()
+                    else audioMeter.stop()
+                }
+                showPanel()
+            }
+            val chipParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            chipParams.rightMargin = dp(6)
+            row.addView(chip, chipParams)
+        }
+        val row2 = panelRow()
+        val ireLabel = label(
+            "Zebra a partir de ${state.zebraIre} IRE", 12f, Color.WHITE, bold = true
+        )
+        row2.addView(ireLabel)
+        val row3 = panelRow()
+        row3.addView(
+            seekBar(6, (state.zebraIre - 70) / 5) {
+                state.zebraIre = 70 + it * 5
+                ireLabel.text = "Zebra a partir de ${state.zebraIre} IRE"
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val note = label(
+            "Analise leve da previa (~8 fps). Se a sessao de gravacao " +
+                "encher, a imagem do monitoramento pausa e a gravacao segue.",
+            10.5f, MUTED
+        )
+        note.setPadding(0, dp(4), 0, dp(2))
+        panel.addView(note)
+    }
+
     private fun seekBar(
         max: Int, progress: Int, onChange: (Int) -> Unit
     ): SeekBar {
@@ -1014,6 +1229,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         panel.visibility = View.VISIBLE
         if (panelKind == PanelKind.MODE) {
             showModePanel()
+            return
+        }
+        if (panelKind == PanelKind.MONITOR) {
+            showMonitorPanel()
             return
         }
         val control = selected ?: return
@@ -1658,12 +1877,17 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         uiHandler.post {
             recCore.background = recCoreDrawable(recording)
             if (recording) {
+                // Medidores passam a vir do MediaRecorder; o leitor de
+                // espera para para nao disputar o microfone.
+                audioMeter.stop()
+                peakDb = -60f
                 timecodeText.setTextColor(RED)
                 showStatus(
                     if (state.destSsd) "Gravando no SSD." else "Gravando em Movies/DXCam."
                 )
                 startHudTick()
             } else {
+                if (state.metersOn) audioMeter.start()
                 showStatus(
                     if (state.destSsd) "Gravacao salva no SSD."
                     else "Gravacao salva em Movies/DXCam."
@@ -1689,6 +1913,33 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         }
     }
 
+    override fun onInfo(message: String) {
+        uiHandler.post { showStatus(message) }
+    }
+
+    /**
+     * Etapa 4: a analise roda aqui (thread de fundo do motor) e so o
+     * desenho vai para a tela.
+     */
+    override fun onAnalysisFrame(y: ByteArray, width: Int, height: Int) {
+        if (!state.zebraOn && !state.peakingOn && !state.histoOn) return
+        val result = MonitorAnalyzer.analyze(
+            y, width, height,
+            zebraLuma = state.zebraIre * 255 / 100,
+            wantZebra = state.zebraOn,
+            wantPeaking = state.peakingOn
+        )
+        uiHandler.post {
+            if (state.histoOn) {
+                histoView.bins = result.histogram
+                histoView.invalidate()
+            }
+            overlayView.zebraCells = result.zebra
+            overlayView.peakCells = result.peaking
+            overlayView.invalidate()
+        }
+    }
+
     /** Grade de tercos sobre o visor (botao GUIAS da regua lateral). */
     private class GridView(context: android.content.Context) : View(context) {
         private val paint = Paint().apply {
@@ -1704,6 +1955,157 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             canvas.drawLine(2 * w / 3, 0f, 2 * w / 3, h, paint)
             canvas.drawLine(0f, h / 3, w, h / 3, paint)
             canvas.drawLine(0f, 2 * h / 3, w, 2 * h / 3, paint)
+        }
+    }
+
+    /** Histograma de luminancia (64 faixas) da Etapa 4. */
+    private class HistogramView(context: android.content.Context) : View(context) {
+        var bins: IntArray? = null
+        private val paint = Paint()
+        private val hotPaint = Paint().apply { color = 0xFFFF6B5E.toInt() }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val data = bins ?: return
+            val max = data.maxOrNull() ?: 0
+            if (max <= 0 || width == 0 || height == 0) return
+            val barWidth = width.toFloat() / data.size
+            for (i in data.indices) {
+                val h = data[i].toFloat() / max * (height - 2)
+                paint.color = 0xD9FFFFFF.toInt()
+                val usePaint = if (i >= data.size - 6) hotPaint else paint
+                canvas.drawRect(
+                    i * barWidth, height - h,
+                    (i + 1) * barWidth - 0.5f, height.toFloat(),
+                    usePaint
+                )
+            }
+        }
+    }
+
+    /** Medidor de audio com zonas verde/amarela/vermelha e marca de pico. */
+    private class MeterView(context: android.content.Context) : View(context) {
+        var db: Float = -60f
+        var peakDb: Float = -60f
+        private val trackPaint = Paint().apply { color = 0x2EFFFFFF }
+        private val greenPaint = Paint().apply { color = 0xFF25C33B.toInt() }
+        private val yellowPaint = Paint().apply { color = 0xFFE8C51C.toInt() }
+        private val redPaint = Paint().apply { color = 0xFFE33E3E.toInt() }
+        private val peakPaint = Paint().apply { color = Color.WHITE }
+
+        private fun fraction(valueDb: Float): Float =
+            ((valueDb + 45f) / 48f).coerceIn(0f, 1f)
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            canvas.drawRect(0f, 0f, w, h, trackPaint)
+            val fill = fraction(db) * w
+            val greenEnd = fraction(-10f) * w
+            val yellowEnd = fraction(-3f) * w
+            if (fill > 0f) {
+                canvas.drawRect(0f, 0f, minOf(fill, greenEnd), h, greenPaint)
+            }
+            if (fill > greenEnd) {
+                canvas.drawRect(greenEnd, 0f, minOf(fill, yellowEnd), h, yellowPaint)
+            }
+            if (fill > yellowEnd) {
+                canvas.drawRect(yellowEnd, 0f, fill, h, redPaint)
+            }
+            val peakX = fraction(peakDb) * w
+            if (peakDb > -59f) {
+                canvas.drawRect(peakX - 1f, 0f, peakX + 1f, h, peakPaint)
+            }
+        }
+    }
+
+    /**
+     * Sobreposicao da Etapa 4: zebra (celulas acima do limiar), peaking
+     * (bordas fortes) e a linha do nivel com o angulo em graus.
+     */
+    private class MonitorOverlay(context: android.content.Context) : View(context) {
+        var zebraCells: BooleanArray? = null
+        var peakCells: BooleanArray? = null
+        var showZebra: Boolean = true
+        var showPeaking: Boolean = false
+        var showLevel: Boolean = false
+        var levelAngleDeg: Float = 0f
+
+        private val zebraFill = Paint().apply { color = 0x30FF3B30 }
+        private val zebraLine = Paint().apply {
+            color = 0xA0FF3B30.toInt()
+            strokeWidth = 2f
+        }
+        private val peakPaint = Paint().apply { color = 0xFF40FFA0.toInt() }
+        private val levelPaint = Paint().apply {
+            color = Color.WHITE
+            strokeWidth = 3f
+        }
+        private val levelDot = Paint().apply { color = AMBER_STATIC }
+        private val levelText = Paint().apply {
+            color = Color.WHITE
+            textSize = 30f
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w == 0f || h == 0f) return
+            val cellW = w / MonitorAnalyzer.COLS
+            val cellH = h / MonitorAnalyzer.ROWS
+            val zebra = zebraCells
+            if (showZebra && zebra != null) {
+                for (r in 0 until MonitorAnalyzer.ROWS) {
+                    for (c in 0 until MonitorAnalyzer.COLS) {
+                        if (!zebra[r * MonitorAnalyzer.COLS + c]) continue
+                        val x = c * cellW
+                        val y = r * cellH
+                        canvas.drawRect(x, y, x + cellW, y + cellH, zebraFill)
+                        canvas.drawLine(x, y + cellH, x + cellW, y, zebraLine)
+                    }
+                }
+            }
+            val peaks = peakCells
+            if (showPeaking && peaks != null) {
+                for (r in 0 until MonitorAnalyzer.ROWS) {
+                    for (c in 0 until MonitorAnalyzer.COLS) {
+                        if (!peaks[r * MonitorAnalyzer.COLS + c]) continue
+                        val cx = c * cellW + cellW / 2
+                        val cy = r * cellH + cellH / 2
+                        canvas.drawRect(
+                            cx - cellW * 0.32f, cy - 1.5f,
+                            cx + cellW * 0.32f, cy + 1.5f,
+                            peakPaint
+                        )
+                    }
+                }
+            }
+            if (showLevel) {
+                val cx = w / 2
+                val cy = h / 2
+                canvas.save()
+                canvas.translate(cx, cy)
+                canvas.rotate(levelAngleDeg)
+                val half = w * 0.30f
+                canvas.drawLine(-half, 0f, -dp8, 0f, levelPaint)
+                canvas.drawLine(dp8, 0f, half, 0f, levelPaint)
+                canvas.restore()
+                canvas.drawCircle(cx, cy, 5f, levelDot)
+                val text = String.format(
+                    Locale.US, "%.0f°", kotlin.math.abs(levelAngleDeg)
+                )
+                canvas.drawText(text, cx, cy + 44f, levelText)
+            }
+        }
+
+        private val dp8: Float = 10f
+
+        companion object {
+            private val AMBER_STATIC = Color.rgb(255, 179, 0)
         }
     }
 
