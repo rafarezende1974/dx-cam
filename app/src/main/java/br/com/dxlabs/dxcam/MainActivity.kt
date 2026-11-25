@@ -5,6 +5,8 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
@@ -19,6 +21,8 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.media.MediaMetadataRetriever
+import android.net.Uri
 import android.os.BatteryManager
 import android.os.Bundle
 import android.os.Environment
@@ -27,6 +31,8 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.os.StatFs
 import android.os.SystemClock
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.util.Size
 import android.util.TypedValue
 import android.view.GestureDetector
@@ -41,9 +47,13 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.MediaController
+import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
+import android.widget.VideoView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -120,6 +130,37 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
     // Etapa 6 (foto): flash do obturador sobre o visor.
     private lateinit var flashView: View
+
+    // Etapa 7: abas Midia e Configuracoes em telas sobre o visor.
+    private enum class TabKind { CAMERA, MEDIA, SETTINGS }
+    private var currentTab: TabKind = TabKind.CAMERA
+    private val tabViews =
+        mutableMapOf<TabKind, Triple<LinearLayout, TextView, TextView>>()
+    private lateinit var rootFrame: FrameLayout
+    private lateinit var mediaView: LinearLayout
+    private lateinit var mediaList: LinearLayout
+    private lateinit var mediaHint: TextView
+    private lateinit var settingsView: ScrollView
+    private lateinit var settingsContainer: LinearLayout
+    private lateinit var viewerView: LinearLayout
+    private lateinit var viewerTitle: TextView
+    private var viewerVideo: VideoView? = null
+    private var viewerImage: ImageView? = null
+    private var viewerNote: TextView? = null
+    private var viewerItem: MediaItem? = null
+    private var mediaSourceSsd: Boolean = false
+
+    private data class MediaItem(
+        val name: String,
+        val uri: Uri,
+        val video: Boolean,
+        val dng: Boolean,
+        val mime: String,
+        val sizeBytes: Long,
+        val durationMs: Long,
+        val dateMs: Long,
+        val fromSsd: Boolean
+    )
 
     private val cellValues = mutableMapOf<Control, TextView>()
     private val cellNames = mutableMapOf<Control, TextView>()
@@ -484,7 +525,21 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         buildRail(rootRow)
         buildTabs(rootRow)
 
-        setContentView(rootRow)
+        // Etapa 7: moldura raiz para as abas cobrirem visor + regua,
+        // deixando a coluna de abas sempre visivel a direita.
+        rootFrame = FrameLayout(this)
+        rootFrame.setBackgroundColor(Color.BLACK)
+        rootFrame.addView(
+            rootRow,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        buildMediaView()
+        buildSettingsView()
+        buildViewerView()
+        setContentView(rootFrame)
         refreshModeUi()
         refreshHud()
         refreshStorage()
@@ -960,17 +1015,17 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             tabs,
             LinearLayout.LayoutParams(dp(78), ViewGroup.LayoutParams.MATCH_PARENT)
         )
-        fun tab(glyph: String, caption: String, active: Boolean, onClick: () -> Unit) {
+        fun tab(
+            kind: TabKind, glyph: String, caption: String, onClick: () -> Unit
+        ) {
             val tabView = LinearLayout(this)
             tabView.orientation = LinearLayout.VERTICAL
             tabView.gravity = Gravity.CENTER
             tabView.setPadding(dp(2), dp(9), dp(2), dp(9))
-            if (active) tabView.background = roundedBg(0x2E2E7CF6, 9)
-            val color = if (active) BLUE_LIGHT else TAB_MUTED
-            val glyphView = label(glyph, 19f, color)
+            val glyphView = label(glyph, 19f, TAB_MUTED)
             glyphView.gravity = Gravity.CENTER
             tabView.addView(glyphView)
-            val captionView = label(caption, 9f, color, bold = active)
+            val captionView = label(caption, 9f, TAB_MUTED)
             captionView.gravity = Gravity.CENTER
             tabView.addView(captionView)
             tabView.setOnClickListener { onClick() }
@@ -979,18 +1034,762 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             )
             params.topMargin = dp(6)
             tabs.addView(tabView, params)
+            tabViews[kind] = Triple(tabView, glyphView, captionView)
         }
-        tab("▣", "Câmera", active = true) {
+        tab(TabKind.CAMERA, "▣", "Câmera") { selectTab(TabKind.CAMERA) }
+        tab(TabKind.MEDIA, "▶", "Mídia") { selectTab(TabKind.MEDIA) }
+        tab(TabKind.SETTINGS, "⚙", "Configurações") { selectTab(TabKind.SETTINGS) }
+        refreshTabs()
+    }
+
+    private fun refreshTabs() {
+        for ((kind, views) in tabViews) {
+            val active = kind == currentTab
+            val (container, glyphView, captionView) = views
+            container.background =
+                if (active) roundedBg(0x2E2E7CF6, 9) else null
+            val color = if (active) BLUE_LIGHT else TAB_MUTED
+            glyphView.setTextColor(color)
+            captionView.setTextColor(color)
+            captionView.typeface = Typeface.create(
+                Typeface.DEFAULT, if (active) Typeface.BOLD else Typeface.NORMAL
+            )
+        }
+    }
+
+    private fun selectTab(kind: TabKind) {
+        if (kind != TabKind.CAMERA && engine.recording) {
+            showStatus("Termine a gravacao para trocar de aba.")
+            return
+        }
+        currentTab = kind
+        if (kind == TabKind.CAMERA) {
             panelKind = PanelKind.NONE
             selected = null
             showPanel()
         }
-        tab("▶", "Mídia", active = false) {
-            showStatus("Aba Midia chega na Etapa 7.")
+        if (kind != TabKind.MEDIA) closeViewer()
+        mediaView.visibility = if (kind == TabKind.MEDIA) View.VISIBLE else View.GONE
+        settingsView.visibility =
+            if (kind == TabKind.SETTINGS) View.VISIBLE else View.GONE
+        refreshTabs()
+        if (kind == TabKind.MEDIA) loadMedia()
+        if (kind == TabKind.SETTINGS) buildSettings()
+    }
+
+    // ---------------------------------------------------------------
+    // Etapa 7: aba Midia (grade + visualizador) e Configuracoes
+    // ---------------------------------------------------------------
+    private fun overlayParams(): FrameLayout.LayoutParams {
+        val params = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        params.rightMargin = dp(78)
+        return params
+    }
+
+    private fun buildMediaView() {
+        mediaView = LinearLayout(this)
+        mediaView.orientation = LinearLayout.VERTICAL
+        mediaView.setBackgroundColor(0xFF0B1220.toInt())
+        mediaView.setPadding(dp(12), dp(10), dp(12), dp(10))
+        mediaView.visibility = View.GONE
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.HORIZONTAL
+        header.gravity = Gravity.CENTER_VERTICAL
+        val title = label("MÍDIA — material do DX Cam", 14f, Color.WHITE, bold = true)
+        header.addView(
+            title,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val internalChip = chipButton("INTERNO", !mediaSourceSsd) {
+            mediaSourceSsd = false
+            rebuildMediaHeader()
+            loadMedia()
         }
-        tab("⚙", "Configurações", active = false) {
-            showStatus("Configuracoes chegam na Etapa 7.")
+        internalChip.tag = "media-src-internal"
+        header.addView(internalChip)
+        val ssdChip = chipButton("SSD", mediaSourceSsd) {
+            if (state.treeUri.isEmpty()) {
+                showStatus("SSD ainda nao escolhido: defina no painel do modo ou nas Configuracoes.")
+            } else {
+                mediaSourceSsd = true
+                rebuildMediaHeader()
+                loadMedia()
+            }
         }
+        ssdChip.tag = "media-src-ssd"
+        val ssdParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        ssdParams.leftMargin = dp(6)
+        header.addView(ssdChip, ssdParams)
+        val refreshButton = smallButton("ATUALIZAR")
+        refreshButton.setOnClickListener { loadMedia() }
+        val refreshParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        refreshParams.leftMargin = dp(6)
+        header.addView(refreshButton, refreshParams)
+        mediaView.addView(header)
+        mediaHint = label("", 11f, MUTED)
+        mediaHint.setPadding(0, dp(4), 0, dp(4))
+        mediaView.addView(mediaHint)
+        val scroll = ScrollView(this)
+        mediaList = LinearLayout(this)
+        mediaList.orientation = LinearLayout.VERTICAL
+        scroll.addView(mediaList)
+        mediaView.addView(
+            scroll,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+        )
+        rootFrame.addView(mediaView, overlayParams())
+    }
+
+    /** Recria a tela de midia para os chips de origem refletirem a escolha. */
+    private fun rebuildMediaHeader() {
+        rootFrame.removeView(mediaView)
+        buildMediaView()
+        mediaView.visibility = View.VISIBLE
+    }
+
+    private fun loadMedia() {
+        mediaList.removeAllViews()
+        mediaHint.text = "Carregando..."
+        val fromSsd = mediaSourceSsd
+        Thread {
+            val items = try {
+                if (fromSsd) loadSsdItems() else loadInternalItems()
+            } catch (e: Exception) {
+                emptyList()
+            }
+            uiHandler.post {
+                if (currentTab == TabKind.MEDIA && mediaSourceSsd == fromSsd) {
+                    renderMediaItems(items, fromSsd)
+                }
+            }
+        }.start()
+    }
+
+    private fun loadInternalItems(): List<MediaItem> {
+        val items = mutableListOf<MediaItem>()
+        val videoProjection = arrayOf(
+            MediaStore.Video.Media._ID,
+            MediaStore.Video.Media.DISPLAY_NAME,
+            MediaStore.Video.Media.DURATION,
+            MediaStore.Video.Media.SIZE,
+            MediaStore.Video.Media.DATE_ADDED
+        )
+        contentResolver.query(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            videoProjection,
+            "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?",
+            arrayOf("Movies/DXCam%"),
+            "${MediaStore.Video.Media.DATE_ADDED} DESC"
+        )?.use { cursor ->
+            val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+            val durCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
+            val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
+            val dateCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)
+            while (cursor.moveToNext()) {
+                val uri = Uri.withAppendedPath(
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                    cursor.getLong(idCol).toString()
+                )
+                items.add(
+                    MediaItem(
+                        name = cursor.getString(nameCol) ?: "video",
+                        uri = uri,
+                        video = true,
+                        dng = false,
+                        mime = "video/mp4",
+                        sizeBytes = cursor.getLong(sizeCol),
+                        durationMs = cursor.getLong(durCol),
+                        dateMs = cursor.getLong(dateCol) * 1000,
+                        fromSsd = false
+                    )
+                )
+            }
+        }
+        val imageProjection = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.MIME_TYPE,
+            MediaStore.Images.Media.SIZE,
+            MediaStore.Images.Media.DATE_ADDED
+        )
+        contentResolver.query(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            imageProjection,
+            "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?",
+            arrayOf("Pictures/DXCam%"),
+            "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        )?.use { cursor ->
+            val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+            val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.MIME_TYPE)
+            val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
+            val dateCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+            while (cursor.moveToNext()) {
+                val name = cursor.getString(nameCol) ?: "foto"
+                val uri = Uri.withAppendedPath(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    cursor.getLong(idCol).toString()
+                )
+                items.add(
+                    MediaItem(
+                        name = name,
+                        uri = uri,
+                        video = false,
+                        dng = name.lowercase().endsWith(".dng"),
+                        mime = cursor.getString(mimeCol) ?: "image/jpeg",
+                        sizeBytes = cursor.getLong(sizeCol),
+                        durationMs = 0,
+                        dateMs = cursor.getLong(dateCol) * 1000,
+                        fromSsd = false
+                    )
+                )
+            }
+        }
+        return items.sortedByDescending { it.dateMs }.take(60)
+    }
+
+    private fun loadSsdItems(): List<MediaItem> {
+        if (state.treeUri.isEmpty()) return emptyList()
+        val treeUri = Uri.parse(state.treeUri)
+        val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+            treeUri, treeDocId
+        )
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED
+        )
+        val items = mutableListOf<MediaItem>()
+        contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            val idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            val sizeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)
+            val dateCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+            while (cursor.moveToNext()) {
+                val name = cursor.getString(nameCol) ?: continue
+                val mime = cursor.getString(mimeCol) ?: ""
+                val lower = name.lowercase()
+                val isVideo = mime.startsWith("video/") || lower.endsWith(".mp4")
+                val isDng = lower.endsWith(".dng")
+                val isImage = mime.startsWith("image/") || isDng ||
+                    lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+                if (!isVideo && !isImage) continue
+                val docUri = DocumentsContract.buildDocumentUriUsingTree(
+                    treeUri, cursor.getString(idCol)
+                )
+                items.add(
+                    MediaItem(
+                        name = name,
+                        uri = docUri,
+                        video = isVideo,
+                        dng = isDng,
+                        mime = if (isDng) "image/x-adobe-dng" else mime,
+                        sizeBytes = if (cursor.isNull(sizeCol)) 0 else cursor.getLong(sizeCol),
+                        durationMs = 0,
+                        dateMs = if (cursor.isNull(dateCol)) 0 else cursor.getLong(dateCol),
+                        fromSsd = true
+                    )
+                )
+            }
+        }
+        return items.sortedByDescending { it.dateMs }.take(60)
+    }
+
+    private fun renderMediaItems(items: List<MediaItem>, fromSsd: Boolean) {
+        mediaList.removeAllViews()
+        mediaHint.text = if (items.isEmpty()) {
+            if (fromSsd) {
+                "Nenhum arquivo do DX Cam nesta pasta do SSD ainda."
+            } else {
+                "Nenhum video ou foto do DX Cam ainda. Grave ou fotografe e volte aqui."
+            }
+        } else {
+            "${items.size} itens ${if (fromSsd) "no SSD" else "no aparelho"} " +
+                "— toque para conferir."
+        }
+        var index = 0
+        while (index < items.size) {
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            for (offset in 0 until 3) {
+                val itemIndex = index + offset
+                if (itemIndex >= items.size) {
+                    row.addView(
+                        View(this),
+                        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    )
+                    continue
+                }
+                row.addView(
+                    mediaCard(items[itemIndex]),
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                )
+            }
+            mediaList.addView(row)
+            index += 3
+        }
+    }
+
+    private fun mediaCard(item: MediaItem): View {
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.setPadding(dp(4), dp(4), dp(4), dp(8))
+        val thumb = ImageView(this)
+        thumb.setBackgroundColor(0xFF1B2740.toInt())
+        thumb.scaleType = ImageView.ScaleType.CENTER_CROP
+        thumb.tag = item.uri.toString()
+        card.addView(thumb, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(84)
+        ))
+        val name = label(item.name, 10f, Color.WHITE)
+        name.maxLines = 1
+        name.ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+        name.setPadding(0, dp(3), 0, 0)
+        card.addView(name)
+        val meta = StringBuilder()
+        if (item.video) {
+            meta.append("VÍDEO")
+            if (item.durationMs > 0) meta.append(" · ").append(formatDuration(item.durationMs))
+        } else if (item.dng) {
+            meta.append("RAW (DNG)")
+        } else {
+            meta.append("FOTO")
+        }
+        if (item.sizeBytes > 0) meta.append(" · ").append(formatSize(item.sizeBytes))
+        val metaView = label(meta.toString(), 9f, MUTED)
+        card.addView(metaView)
+        card.setOnClickListener { openViewer(item) }
+        Thread {
+            val bitmap = loadThumb(item)
+            if (bitmap != null) {
+                uiHandler.post {
+                    if (thumb.tag == item.uri.toString()) {
+                        thumb.setImageBitmap(bitmap)
+                    }
+                }
+            }
+        }.start()
+        return card
+    }
+
+    private fun loadThumb(item: MediaItem): Bitmap? {
+        return try {
+            when {
+                !item.fromSsd -> contentResolver.loadThumbnail(
+                    item.uri, Size(480, 270), null
+                )
+                item.dng -> null
+                item.video -> {
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        contentResolver.openFileDescriptor(item.uri, "r")?.use { pfd ->
+                            retriever.setDataSource(pfd.fileDescriptor)
+                        }
+                        retriever.getFrameAtTime(
+                            0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                        )
+                    } finally {
+                        retriever.release()
+                    }
+                }
+                else -> {
+                    contentResolver.openInputStream(item.uri)?.use { input ->
+                        val bounds = BitmapFactory.Options()
+                        bounds.inJustDecodeBounds = true
+                        BitmapFactory.decodeStream(input, null, bounds)
+                        null
+                    }
+                    contentResolver.openInputStream(item.uri)?.use { input ->
+                        val options = BitmapFactory.Options()
+                        options.inSampleSize = 4
+                        BitmapFactory.decodeStream(input, null, options)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun formatDuration(ms: Long): String {
+        val totalSeconds = ms / 1000
+        return String.format(
+            Locale.US, "%d:%02d", totalSeconds / 60, totalSeconds % 60
+        )
+    }
+
+    private fun formatSize(bytes: Long): String {
+        return if (bytes >= 1_000_000_000) {
+            String.format(Locale.US, "%.1f GB", bytes / 1_000_000_000.0)
+        } else {
+            String.format(Locale.US, "%.0f MB", bytes / 1_000_000.0)
+        }
+    }
+
+    private fun buildViewerView() {
+        viewerView = LinearLayout(this)
+        viewerView.orientation = LinearLayout.VERTICAL
+        viewerView.setBackgroundColor(Color.BLACK)
+        viewerView.setPadding(dp(12), dp(10), dp(12), dp(10))
+        viewerView.visibility = View.GONE
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.HORIZONTAL
+        header.gravity = Gravity.CENTER_VERTICAL
+        viewerTitle = label("", 12f, Color.WHITE, bold = true)
+        viewerTitle.maxLines = 1
+        viewerTitle.ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+        header.addView(
+            viewerTitle,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val openButton = smallButton("ABRIR FORA")
+        openButton.setOnClickListener { openExternal() }
+        header.addView(openButton)
+        val closeButton = smallButton("FECHAR")
+        closeButton.setOnClickListener { closeViewer() }
+        val closeParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        closeParams.leftMargin = dp(6)
+        header.addView(closeButton, closeParams)
+        viewerView.addView(header)
+        val content = FrameLayout(this)
+        viewerView.addView(
+            content,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+        )
+        val video = VideoView(this)
+        video.visibility = View.GONE
+        content.addView(
+            video,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        viewerVideo = video
+        val image = ImageView(this)
+        image.visibility = View.GONE
+        image.scaleType = ImageView.ScaleType.FIT_CENTER
+        content.addView(
+            image,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        viewerImage = image
+        val note = label("", 13f, MUTED)
+        note.gravity = Gravity.CENTER
+        note.visibility = View.GONE
+        content.addView(
+            note,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        viewerNote = note
+        rootFrame.addView(viewerView, overlayParams())
+    }
+
+    private fun openViewer(item: MediaItem) {
+        viewerItem = item
+        viewerTitle.text = item.name
+        viewerVideo?.visibility = View.GONE
+        viewerImage?.visibility = View.GONE
+        viewerNote?.visibility = View.GONE
+        viewerView.visibility = View.VISIBLE
+        when {
+            item.video -> {
+                val video = viewerVideo ?: return
+                video.visibility = View.VISIBLE
+                val controller = MediaController(this)
+                controller.setAnchorView(video)
+                video.setMediaController(controller)
+                video.setVideoURI(item.uri)
+                video.setOnErrorListener { _, _, _ ->
+                    showStatus("Nao consegui tocar este video aqui; use ABRIR FORA.")
+                    true
+                }
+                video.start()
+            }
+            item.dng -> {
+                val note = viewerNote ?: return
+                note.text = "RAW (DNG) nao tem previa aqui.\n" +
+                    "Use ABRIR FORA para ver no Lightroom ou na galeria."
+                note.visibility = View.VISIBLE
+            }
+            else -> {
+                val image = viewerImage ?: return
+                image.visibility = View.VISIBLE
+                image.setImageBitmap(null)
+                Thread {
+                    val bitmap = try {
+                        contentResolver.openInputStream(item.uri)?.use { input ->
+                            val options = BitmapFactory.Options()
+                            options.inSampleSize = 2
+                            BitmapFactory.decodeStream(input, null, options)
+                        }
+                    } catch (e: Exception) {
+                        null
+                    }
+                    uiHandler.post {
+                        if (viewerItem?.uri == item.uri) {
+                            image.setImageBitmap(bitmap)
+                            if (bitmap == null) {
+                                showStatus("Nao consegui abrir a previa; use ABRIR FORA.")
+                            }
+                        }
+                    }
+                }.start()
+            }
+        }
+    }
+
+    private fun closeViewer() {
+        if (!::viewerView.isInitialized) return
+        try {
+            viewerVideo?.stopPlayback()
+        } catch (e: Exception) {
+        }
+        viewerView.visibility = View.GONE
+        viewerItem = null
+    }
+
+    private fun openExternal() {
+        val item = viewerItem ?: return
+        try {
+            val intent = Intent(Intent.ACTION_VIEW)
+            intent.setDataAndType(item.uri, item.mime)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(intent)
+        } catch (e: Exception) {
+            showStatus("Nenhum app externo abriu este arquivo.")
+        }
+    }
+
+    private fun buildSettingsView() {
+        settingsView = ScrollView(this)
+        settingsView.setBackgroundColor(0xFF0B1220.toInt())
+        settingsView.visibility = View.GONE
+        settingsContainer = LinearLayout(this)
+        settingsContainer.orientation = LinearLayout.VERTICAL
+        settingsContainer.setPadding(dp(14), dp(10), dp(14), dp(16))
+        settingsView.addView(settingsContainer)
+        rootFrame.addView(settingsView, overlayParams())
+    }
+
+    private fun settingsSection(title: String) {
+        val view = label(title, 11f, BLUE_LIGHT, bold = true)
+        view.setPadding(0, dp(12), 0, dp(4))
+        settingsContainer.addView(view)
+    }
+
+    private fun sRow(): LinearLayout {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(0, dp(3), 0, dp(3))
+        settingsContainer.addView(row)
+        return row
+    }
+
+    private fun buildSettings() {
+        settingsContainer.removeAllViews()
+        val title = label("CONFIGURAÇÕES", 14f, Color.WHITE, bold = true)
+        settingsContainer.addView(title)
+
+        settingsSection("GRAVAÇÃO — destino, bitrate e projeto")
+        val destRow = sRow()
+        val internalChip = chipButton("INTERNO", !state.destSsd) {
+            onDestChip(false)
+            buildSettings()
+        }
+        destRow.addView(internalChip)
+        val ssdChip = chipButton(
+            if (state.treeUri.isEmpty()) "SSD (escolher pasta)" else "SSD",
+            state.destSsd
+        ) {
+            onDestChip(true)
+            buildSettings()
+        }
+        val ssdParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        ssdParams.leftMargin = dp(6)
+        destRow.addView(ssdChip, ssdParams)
+        if (state.treeUri.isNotEmpty()) {
+            val changeButton = smallButton("TROCAR PASTA DO SSD")
+            changeButton.setOnClickListener { pickSsdFolder() }
+            val changeParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            changeParams.leftMargin = dp(6)
+            destRow.addView(changeButton, changeParams)
+        }
+        val bitrateRow = sRow()
+        val levels = listOf("ECO", "PADRÃO", "ALTO")
+        for ((level, labelText) in levels.withIndex()) {
+            val chip = chipButton(labelText, state.bitrateLevel == level) {
+                setBitrateLevel(level)
+                buildSettings()
+            }
+            val chipParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            chipParams.rightMargin = dp(6)
+            bitrateRow.addView(chip, chipParams)
+        }
+        val bitrateInfo = label(
+            "Bitrate atual: ${state.effectiveBitrateMbps()} Mbps no modo " +
+                state.mode.label + ".",
+            11f, MUTED
+        )
+        settingsContainer.addView(bitrateInfo)
+        val projectRow = sRow()
+        projectRow.addView(
+            label(
+                "Projeto: " +
+                    if (state.projectPrefix.isEmpty()) "(nenhum)"
+                    else state.projectPrefix,
+                12f, Color.WHITE
+            )
+        )
+        val projectButton = smallButton("EDITAR")
+        projectButton.setOnClickListener {
+            editProjectPrefix()
+            buildSettings()
+        }
+        val projectParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        projectParams.leftMargin = dp(8)
+        projectRow.addView(projectButton, projectParams)
+
+        settingsSection("FOTO — formato")
+        val photoRow = sRow()
+        val formats = listOf("RAW + JPEG", "SÓ JPEG", "SÓ RAW (DNG)")
+        for ((format, labelText) in formats.withIndex()) {
+            val chip = chipButton(labelText, state.photoFormat == format) {
+                state.photoFormat = format
+                buildSettings()
+            }
+            val chipParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            chipParams.rightMargin = dp(6)
+            photoRow.addView(chip, chipParams)
+        }
+
+        settingsSection("MONITORAMENTO — padroes do visor")
+        val monitorRow = sRow()
+        val toggles = listOf(
+            Triple("ZEBRA", state.zebraOn) { state.zebraOn = !state.zebraOn },
+            Triple("PEAKING", state.peakingOn) { state.peakingOn = !state.peakingOn },
+            Triple("HISTOGRAMA", state.histoOn) { state.histoOn = !state.histoOn },
+            Triple("MEDIDORES", state.metersOn) { state.metersOn = !state.metersOn },
+            Triple("NÍVEL", state.levelOn) { state.levelOn = !state.levelOn },
+            Triple("GUIAS", state.showGrid) { state.showGrid = !state.showGrid }
+        )
+        for ((labelText, isOn, toggle) in toggles) {
+            val chip = chipButton(labelText, isOn) {
+                toggle()
+                updateMonitoringFlags()
+                applyLevelState()
+                gridView.visibility =
+                    if (state.showGrid) View.VISIBLE else View.GONE
+                refreshGridButton()
+                refreshLevelButton()
+                buildSettings()
+            }
+            val chipParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            chipParams.rightMargin = dp(6)
+            monitorRow.addView(chip, chipParams)
+        }
+        val zebraRow = sRow()
+        zebraRow.addView(label("Zebra ${state.zebraIre} IRE", 12f, Color.WHITE))
+        val zebraSeek = seekBar(30, state.zebraIre - 70) {
+            state.zebraIre = it + 70
+            buildSettings()
+        }
+        val zebraParams = LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+        )
+        zebraParams.leftMargin = dp(10)
+        zebraRow.addView(zebraSeek, zebraParams)
+
+        settingsSection("LUT — previa com look (.cube)")
+        val lutRow = sRow()
+        val lutNames = state.lutPaths().map { File(it).nameWithoutExtension }
+        lutRow.addView(
+            label(
+                when {
+                    lutNames.isEmpty() -> "Nenhuma LUT importada."
+                    state.lutOn -> "Ativa: " +
+                        (lutNames.getOrNull(state.lutActive) ?: "-")
+                    else -> "Importadas: ${lutNames.size} (desligada)"
+                },
+                12f, Color.WHITE
+            )
+        )
+        val lutImport = smallButton("IMPORTAR .CUBE")
+        lutImport.setOnClickListener {
+            lutImportLauncher.launch(arrayOf("*/*"))
+        }
+        val lutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        lutParams.leftMargin = dp(8)
+        lutRow.addView(lutImport, lutParams)
+        val lutIntensityRow = sRow()
+        lutIntensityRow.addView(
+            label("Intensidade ${state.lutIntensity}%", 12f, Color.WHITE)
+        )
+        val lutSeek = seekBar(100, state.lutIntensity) {
+            state.lutIntensity = it
+            lutView?.setIntensity(it / 100f)
+            buildSettings()
+        }
+        val lutSeekParams = LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+        )
+        lutSeekParams.leftMargin = dp(10)
+        lutIntensityRow.addView(lutSeek, lutSeekParams)
+
+        settingsSection("SOBRE")
+        val free = try {
+            val stat = StatFs(Environment.getDataDirectory().path)
+            formatSize(stat.availableBytes)
+        } catch (e: Exception) {
+            "-"
+        }
+        val about = label(
+            "DX Cam v0.8.0-midia — DX Labs\n" +
+                "Camera de cinema para o S24: video manual, foto RAW, " +
+                "monitoramento e LUT so na previa.\n" +
+                "Espaco livre no aparelho: $free.",
+            12f, MUTED
+        )
+        settingsContainer.addView(about)
     }
 
     // ---------------------------------------------------------------
