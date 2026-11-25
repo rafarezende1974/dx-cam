@@ -6,9 +6,9 @@ App Android da DX Labs estilo Rabbit Cam / Blackmagic Camera: transforma o Galax
 - **Aparelho principal:** Galaxy S24 · **secundário:** Galaxy Tab S9+
 - **Plano da v1:** documento "Plano DX Cam v1" (documentos do DX Cam, fora deste repo)
 
-## Estado atual: Fase 0 (diagnóstico) — v0.1.2-diag
+## Estado atual: v1 em construção — Etapa 2 (núcleo de câmera), v0.2.0-core
 
-> Histórico: v0.1.1 corrigiu o travamento da v0.1.0 no S24 (sessão só com a superfície do gravador nunca configurava). Reteste da v0.1.1 (25/11/2026): gravações estáveis e RAW aprovado (DNG de 25 MB), mas os dois clipes saíram a ~29,2 fps (877 quadros em 30 s) em vez de 24/60 — o pedido não fixava a faixa de fps — e o clipe 4K saiu SDR/BT.709 pelo caminho padrão. A v0.1.2 fixa `CONTROL_AE_TARGET_FPS_RANGE`, prova o controle manual em vídeo (trava ISO/obturador/foco/branco na metade e lê o CaptureResult) e testa a sessão 10-bit com perfil HLG10.
+> **Fase 0 FECHADA em 25/11/2026** (3 relatórios do S24; resultados e decisões travadas no adendo do plano). A v0.2.0-core é o app de verdade nascendo: visor em tela cheia, faixa manual com valores reais lidos do quadro (ISO, obturador, branco, foco, EV, zoom), painel de ajuste fino sobre o visor, trava por toque longo, foco por toque, pinça para zoom, estado persistente ao reabrir e GRAVAR básico para `Movies/DXCam` (SDR e HDR 10-bit) pelo caminho provado na Fase 0. Próximas etapas: 3) gravação completa (destinos/SSD, bitrate em níveis, nomeação), 4) monitoramento, 5) LUT, 6) foto, 7) mídia/configurações, 8) teste de campo. O código da Fase 0 (`Probes.kt`, `CameraTester.kt`) segue no repo como referência; o guia de teste desta etapa é o `TESTE-ETAPA-2.md`.
 
 Nenhuma tela da v1 é codada antes da Fase 0. Este app (`DX Cam Diag`) roda no S24 real e responde, com números, o que o aparelho entrega:
 

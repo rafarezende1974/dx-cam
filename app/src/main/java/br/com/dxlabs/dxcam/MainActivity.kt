@@ -1,54 +1,83 @@
 package br.com.dxlabs.dxcam
 
 import android.Manifest
-import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.SurfaceTexture
 import android.graphics.Typeface
-import android.media.MediaRecorder
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
+import android.os.StatFs
+import android.os.SystemClock
 import android.util.TypedValue
+import android.view.GestureDetector
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
+import android.view.Surface
+import android.view.TextureView
+import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
-import java.io.File
+import java.util.Locale
+import kotlin.math.ln
+import kotlin.math.roundToInt
 
 /**
- * DX Cam Diag - Fase 0 (v0.1.0-diag).
+ * DX Cam v1 - tela de camera (Etapa 2: nucleo).
  *
- * App de diagnostico do DX Cam: le as capacidades reais da camera do
- * aparelho (Camera2), grava clipes curtos de teste, tira uma foto RAW de
- * teste, mede a escrita no armazenamento e gera um relatorio em texto
- * para compartilhar (WhatsApp/e-mail). E esse relatorio que fecha a
- * lista de resolucoes, codecs e controles da v1 - ver TESTE-FASE-0.md.
- *
- * Uma tela so, de proposito: botoes de teste no topo e o relatorio
- * rolando embaixo. Nenhum dado sai do aparelho sem o toque em
- * Compartilhar.
+ * Visor em tela cheia, faixa manual na base (ISO, obturador, branco,
+ * foco, EV, zoom) com os valores REAIS lidos do quadro, painel de ajuste
+ * fino sobre o visor ao tocar num controle, trava por toque longo e
+ * botao GRAVAR com o caminho provado na Fase 0 (interno, Movies/DXCam;
+ * HDR 10-bit nos modos HDR). Monitoramento e a Etapa 4, LUT a 5, foto a
+ * 6 e destinos/bitrate/nomeacao avancados a Etapa 3.
  */
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
+    private enum class Control { ISO, SHUTTER, WB, FOCUS, EV, ZOOM }
+
+    private lateinit var state: CamState
+    private lateinit var engine: CameraEngine
+    private lateinit var textureView: TextureView
+    private lateinit var modeButton: Button
+    private lateinit var spaceText: TextView
+    private lateinit var timerText: TextView
+    private lateinit var warningText: TextView
     private lateinit var statusText: TextView
-    private lateinit var reportText: TextView
-    private lateinit var tester: CameraTester
+    private lateinit var panel: LinearLayout
+    private lateinit var recButton: Button
+
+    private val cellValues = mutableMapOf<Control, TextView>()
+    private val cellNames = mutableMapOf<Control, TextView>()
+    private var selected: Control? = null
+    private var lastReadback: CameraEngine.Readback? = null
 
     private val bgThread = HandlerThread("dxcam-bg")
     private lateinit var bgHandler: Handler
+    private val uiHandler = Handler(Looper.getMainLooper())
 
-    private val report = StringBuilder()
-    private var reportFile: File? = null
+    private var surfaceReady = false
+    private var engineOpened = false
+    private var recordStartMs: Long = 0
+    private var timerRunnable: Runnable? = null
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            probeAll()
+            maybeOpenEngine()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -56,222 +85,808 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         bgThread.start()
         bgHandler = Handler(bgThread.looper)
-        tester = CameraTester(this, bgHandler)
+        state = CamState(this)
+        engine = CameraEngine(this, bgHandler, state, this)
         buildUi()
-        if (!hasCameraPermissions()) {
+        if (!hasPermissions()) {
             permissionLauncher.launch(
                 arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
             )
         }
-        probeAll()
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        stopTimer()
+        engine.close()
         bgThread.quitSafely()
+        super.onDestroy()
     }
 
-    private fun hasCameraPermissions(): Boolean {
-        val camera = ContextCompat.checkSelfPermission(
+    private fun hasPermissions(): Boolean =
+        ContextCompat.checkSelfPermission(
             this, Manifest.permission.CAMERA
-        ) == PackageManager.PERMISSION_GRANTED
-        val audio = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.RECORD_AUDIO
-        ) == PackageManager.PERMISSION_GRANTED
-        return camera && audio
+        ) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(
+                this, Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+
+    private fun maybeOpenEngine() {
+        if (engineOpened || !surfaceReady || !hasPermissions()) return
+        engineOpened = true
+        val texture = textureView.surfaceTexture ?: return
+        val size = engine.previewSize()
+        texture.setDefaultBufferSize(size.width, size.height)
+        adjustAspect()
+        engine.open(Surface(texture))
+    }
+
+    // ---------------------------------------------------------------
+    // Construcao da interface
+    // ---------------------------------------------------------------
+    private fun dp(value: Int): Int = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics
+    ).toInt()
+
+    private fun label(
+        text: String, sizeSp: Float, color: Int, bold: Boolean = false
+    ): TextView {
+        val view = TextView(this)
+        view.text = text
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
+        view.setTextColor(color)
+        if (bold) view.typeface = Typeface.DEFAULT_BOLD
+        return view
+    }
+
+    private fun smallButton(text: String): Button {
+        val button = Button(this)
+        button.text = text
+        button.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        button.setTextColor(Color.WHITE)
+        button.setBackgroundColor(0x33FFFFFF)
+        button.setPadding(dp(10), dp(4), dp(10), dp(4))
+        return button
     }
 
     private fun buildUi() {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
-        }
-        val title = TextView(this).apply {
-            text = "DX Cam Diag - Fase 0"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
-            typeface = Typeface.DEFAULT_BOLD
-        }
-        root.addView(title)
-        val subtitle = TextView(this).apply {
-            text = "1) Confira o diagnostico  2) Rode os testes  3) Compartilhe o relatorio"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-        }
-        root.addView(subtitle)
-        statusText = TextView(this).apply {
-            text = "Lendo capacidades do aparelho..."
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            setPadding(0, dp(8), 0, dp(8))
-        }
-        root.addView(statusText)
+        val root = FrameLayout(this)
+        root.setBackgroundColor(Color.BLACK)
 
-        root.addView(button("Atualizar diagnóstico") { probeAll() })
-        root.addView(button("Gravar teste 4K 24p H.265 (30 s)") {
-            if (!ensurePermissions()) return@button
-            tester.recordTest(
-                label = "4k24_hevc",
-                width = 3840, height = 2160, fps = 24,
-                videoEncoder = MediaRecorder.VideoEncoder.HEVC,
-                bitrateMbps = 50,
-                durationMs = 30_000,
-                outDir = videoDir(),
-                status = { setStatus(it) },
-                done = { appendSection(it) }
+        textureView = TextureView(this)
+        root.addView(
+            textureView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
             )
-        })
-        root.addView(button("Gravar teste 4K 24p H.265 10-BIT HLG (30 s)") {
-            if (!ensurePermissions()) return@button
-            tester.recordTest(
-                label = "4k24_hevc_hlg10",
-                width = 3840, height = 2160, fps = 24,
-                videoEncoder = MediaRecorder.VideoEncoder.HEVC,
-                bitrateMbps = 50,
-                durationMs = 30_000,
-                outDir = videoDir(),
-                hlg = true,
-                manualSecondHalf = false,
-                status = { setStatus(it) },
-                done = { appendSection(it) }
-            )
-        })
-        root.addView(button("Gravar teste 1080p 60p H.264 (30 s)") {
-            if (!ensurePermissions()) return@button
-            tester.recordTest(
-                label = "1080p60_h264",
-                width = 1920, height = 1080, fps = 60,
-                videoEncoder = MediaRecorder.VideoEncoder.H264,
-                bitrateMbps = 28,
-                durationMs = 30_000,
-                outDir = videoDir(),
-                status = { setStatus(it) },
-                done = { appendSection(it) }
-            )
-        })
-        root.addView(button("Foto RAW de teste (DNG + JPEG)") {
-            if (!ensurePermissions()) return@button
-            tester.captureRawTest(
-                outDir = picturesDir(),
-                status = { setStatus(it) },
-                done = { appendSection(it) }
-            )
-        })
-        root.addView(button("Teste de escrita 128 MB (interno/SSD)") {
-            setStatus("Medindo a escrita... pode levar alguns segundos.")
-            bgHandler.post {
-                tester.writeSpeedTest { appendSection(it) }
-            }
-        })
-        root.addView(button("Salvar relatório") { saveReport() })
-        root.addView(button("Compartilhar relatório (WhatsApp)") { shareReport() })
-
-        reportText = TextView(this).apply {
-            typeface = Typeface.MONOSPACE
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setTextIsSelectable(true)
-            setPadding(0, dp(12), 0, 0)
-        }
-        val scroll = ScrollView(this).apply {
-            addView(reportText)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-            )
-        }
-        root.addView(scroll)
-        setContentView(root)
-    }
-
-    private fun button(label: String, onClick: () -> Unit): Button {
-        return Button(this).apply {
-            text = label
-            isAllCaps = false
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, dp(4), 0, 0) }
-            setOnClickListener { onClick() }
-        }
-    }
-
-    private fun dp(value: Int): Int =
-        (value * resources.displayMetrics.density).toInt()
-
-    private fun ensurePermissions(): Boolean {
-        if (hasCameraPermissions()) return true
-        setStatus("Faltam permissoes de camera/microfone - pedindo de novo...")
-        permissionLauncher.launch(
-            arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
         )
-        return false
+        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(
+                surface: SurfaceTexture, width: Int, height: Int
+            ) {
+                surfaceReady = true
+                maybeOpenEngine()
+            }
+
+            override fun onSurfaceTextureSizeChanged(
+                surface: SurfaceTexture, width: Int, height: Int
+            ) {
+                adjustAspect()
+            }
+
+            override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                surfaceReady = false
+                engineOpened = false
+                engine.close()
+                return true
+            }
+
+            override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+        }
+        installTouch()
+
+        // Barra superior: marca, modo e espaco livre.
+        val topBar = LinearLayout(this)
+        topBar.orientation = LinearLayout.HORIZONTAL
+        topBar.setBackgroundColor(0xB0000000.toInt())
+        topBar.setPadding(dp(12), dp(8), dp(12), dp(8))
+        topBar.gravity = Gravity.CENTER_VERTICAL
+        val topParams = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        topParams.gravity = Gravity.TOP
+        root.addView(topBar, topParams)
+
+        val brand = label("DX CAM", 15f, AMBER, bold = true)
+        topBar.addView(brand)
+        modeButton = smallButton("")
+        modeButton.setOnClickListener { cycleMode() }
+        val modeParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        modeParams.leftMargin = dp(12)
+        topBar.addView(modeButton, modeParams)
+        timerText = label("", 14f, RED, bold = true)
+        timerText.typeface = Typeface.MONOSPACE
+        timerText.visibility = View.GONE
+        val timerParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        timerParams.leftMargin = dp(12)
+        topBar.addView(timerText, timerParams)
+        val spacer = View(this)
+        topBar.addView(
+            spacer,
+            LinearLayout.LayoutParams(0, 1, 1f)
+        )
+        spaceText = label("", 12f, MUTED)
+        topBar.addView(spaceText)
+
+        // Aviso (regra de ouro: valor travado nunca muda em silencio).
+        warningText = label("", 13f, Color.BLACK, bold = true)
+        warningText.setBackgroundColor(AMBER)
+        warningText.setPadding(dp(12), dp(6), dp(12), dp(6))
+        warningText.visibility = View.GONE
+        val warningParams = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        warningParams.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        warningParams.topMargin = dp(52)
+        root.addView(warningText, warningParams)
+
+        // Base: painel de ajuste + faixa manual + acoes.
+        val bottom = LinearLayout(this)
+        bottom.orientation = LinearLayout.VERTICAL
+        bottom.setBackgroundColor(0xB0000000.toInt())
+        val bottomParams = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        bottomParams.gravity = Gravity.BOTTOM
+        root.addView(bottom, bottomParams)
+
+        panel = LinearLayout(this)
+        panel.orientation = LinearLayout.VERTICAL
+        panel.setPadding(dp(12), dp(8), dp(12), dp(4))
+        panel.visibility = View.GONE
+        bottom.addView(panel)
+
+        val strip = LinearLayout(this)
+        strip.orientation = LinearLayout.HORIZONTAL
+        strip.setPadding(dp(4), dp(6), dp(4), dp(2))
+        bottom.addView(strip)
+        for (control in Control.values()) {
+            strip.addView(buildCell(control), LinearLayout.LayoutParams(0, dp(52), 1f))
+        }
+
+        val actionRow = LinearLayout(this)
+        actionRow.orientation = LinearLayout.HORIZONTAL
+        actionRow.gravity = Gravity.CENTER_VERTICAL
+        actionRow.setPadding(dp(12), dp(2), dp(12), dp(10))
+        bottom.addView(actionRow)
+        statusText = label("Abrindo a camera...", 12f, MUTED)
+        actionRow.addView(
+            statusText,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        recButton = Button(this)
+        recButton.text = "●"
+        recButton.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26f)
+        recButton.setTextColor(RED)
+        val recBg = GradientDrawable()
+        recBg.shape = GradientDrawable.OVAL
+        recBg.setColor(0x33FFFFFF)
+        recBg.setStroke(dp(2), Color.WHITE)
+        recButton.background = recBg
+        recButton.setOnClickListener { onRecTapped() }
+        actionRow.addView(recButton, LinearLayout.LayoutParams(dp(64), dp(64)))
+
+        setContentView(root)
+        refreshTop()
+        refreshStrip()
+        updateSpace()
     }
 
-    private fun videoDir(): File =
-        getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
+    private fun buildCell(control: Control): View {
+        val cell = LinearLayout(this)
+        cell.orientation = LinearLayout.VERTICAL
+        cell.gravity = Gravity.CENTER
+        val name = label(controlLabel(control), 9f, MUTED, bold = true)
+        name.gravity = Gravity.CENTER
+        val value = label("-", 14f, Color.WHITE, bold = true)
+        value.typeface = Typeface.MONOSPACE
+        value.gravity = Gravity.CENTER
+        cell.addView(name)
+        cell.addView(value)
+        cellNames[control] = name
+        cellValues[control] = value
+        cell.setOnClickListener {
+            selected = if (selected == control) null else control
+            showPanel()
+            refreshStrip()
+        }
+        cell.setOnLongClickListener {
+            toggleLock(control)
+            true
+        }
+        return cell
+    }
 
-    private fun picturesDir(): File =
-        getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: filesDir
+    private fun controlLabel(control: Control): String = when (control) {
+        Control.ISO -> "ISO"
+        Control.SHUTTER -> "OBTURADOR"
+        Control.WB -> "BRANCO"
+        Control.FOCUS -> "FOCO"
+        Control.EV -> "EV"
+        Control.ZOOM -> "ZOOM"
+    }
 
-    private fun documentsDir(): File =
-        getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+    private fun isManual(control: Control): Boolean = when (control) {
+        Control.ISO -> !state.isoAuto
+        Control.SHUTTER -> !state.shutterAuto
+        Control.WB -> !state.wbAuto
+        Control.FOCUS -> state.focusMode == FocusMode.MANUAL
+        Control.EV -> state.ev != 0f
+        Control.ZOOM -> state.zoomRatio != 1f
+    }
 
-    private fun probeAll() {
-        setStatus("Lendo capacidades do aparelho...")
-        bgHandler.post {
-            val version = try {
-                packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
-            } catch (e: Exception) {
-                "?"
+    private fun isLocked(control: Control): Boolean = when (control) {
+        Control.ISO -> state.isoLocked
+        Control.SHUTTER -> state.shutterLocked
+        Control.WB -> state.wbLocked
+        Control.FOCUS -> state.focusLocked
+        else -> false
+    }
+
+    private fun toggleLock(control: Control) {
+        when (control) {
+            Control.ISO -> {
+                if (!state.isoAuto) state.isoLocked = !state.isoLocked
+                else return showStatus("Trave vale para valor manual: ajuste o ISO primeiro.")
             }
-            val text = StringBuilder()
-            text.append(ReportHeader.build(version))
-            text.append(CameraProbe.buildReport(this))
-            text.append(MediaProbe.buildReport(this))
-            text.appendLine()
-            text.appendLine("Bateria agora: ${CameraTester.batterySnapshot(this)}")
-            text.appendLine()
-            text.appendLine("(Rode os testes abaixo - cada um entra neste relatorio.)")
-            runOnUiThread {
-                report.clear()
-                report.append(text)
-                reportText.text = report.toString()
-                setStatus("Diagnostico pronto. Rode os testes e compartilhe o relatorio.")
+            Control.SHUTTER -> {
+                if (!state.shutterAuto) state.shutterLocked = !state.shutterLocked
+                else return showStatus("Trave vale para valor manual: ajuste o obturador primeiro.")
+            }
+            Control.WB -> {
+                if (!state.wbAuto) state.wbLocked = !state.wbLocked
+                else return showStatus("Trave vale para valor manual: ajuste o branco primeiro.")
+            }
+            Control.FOCUS -> {
+                if (state.focusMode == FocusMode.MANUAL) {
+                    state.focusLocked = !state.focusLocked
+                } else return showStatus("Trave vale para o foco manual.")
+            }
+            else -> return showStatus("Este controle nao tem trava.")
+        }
+        showStatus(
+            "${controlLabel(control)} ${if (isLocked(control)) "TRAVADO" else "destravado"}."
+        )
+        refreshStrip()
+    }
+
+    // ---------------------------------------------------------------
+    // Toque na previa: foco por toque e pinca para zoom
+    // ---------------------------------------------------------------
+    private fun installTouch() {
+        val scaleDetector = ScaleGestureDetector(
+            this,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    state.zoomRatio = (state.zoomRatio * detector.scaleFactor)
+                        .coerceIn(0.6f, 10f)
+                    engine.applyState()
+                    refreshStrip()
+                    if (selected == Control.ZOOM) showPanel()
+                    return true
+                }
+            }
+        )
+        val gestureDetector = GestureDetector(
+            this,
+            object : GestureDetector.SimpleOnGestureListener() {
+                override fun onSingleTapUp(event: MotionEvent): Boolean {
+                    if (textureView.width == 0) return false
+                    if (state.focusMode == FocusMode.MANUAL) {
+                        showStatus("Foco manual: o toque nao muda o foco.")
+                        return true
+                    }
+                    if (state.focusMode != FocusMode.TOUCH) {
+                        state.focusMode = FocusMode.TOUCH
+                        showStatus("Foco por toque. Volte ao AF continuo no painel de FOCO.")
+                    }
+                    engine.tapFocus(
+                        event.x / textureView.width, event.y / textureView.height
+                    )
+                    refreshStrip()
+                    return true
+                }
+            }
+        )
+        textureView.setOnTouchListener { _, event ->
+            scaleDetector.onTouchEvent(event)
+            gestureDetector.onTouchEvent(event)
+            true
+        }
+    }
+
+    private fun adjustAspect() {
+        val width = textureView.width
+        val height = textureView.height
+        if (width == 0 || height == 0) return
+        val viewAspect = width.toFloat() / height
+        val streamAspect = 16f / 9f
+        var scaleX = 1f
+        var scaleY = 1f
+        if (viewAspect > streamAspect) {
+            scaleY = viewAspect / streamAspect
+        } else {
+            scaleX = streamAspect / viewAspect
+        }
+        val matrix = Matrix()
+        matrix.setScale(scaleX, scaleY, width / 2f, height / 2f)
+        textureView.setTransform(matrix)
+    }
+
+    // ---------------------------------------------------------------
+    // Painel de ajuste fino
+    // ---------------------------------------------------------------
+    private fun seekBar(
+        max: Int, progress: Int, onChange: (Int) -> Unit
+    ): SeekBar {
+        val bar = SeekBar(this)
+        bar.max = max
+        bar.progress = progress
+        bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seek: SeekBar, value: Int, fromUser: Boolean) {
+                if (fromUser) onChange(value)
+            }
+
+            override fun onStartTrackingTouch(seek: SeekBar) {}
+            override fun onStopTrackingTouch(seek: SeekBar) {}
+        })
+        return bar
+    }
+
+    private fun panelRow(): LinearLayout {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(0, dp(3), 0, dp(3))
+        panel.addView(row)
+        return row
+    }
+
+    private fun showPanel() {
+        panel.removeAllViews()
+        val control = selected
+        if (control == null) {
+            panel.visibility = View.GONE
+            return
+        }
+        panel.visibility = View.VISIBLE
+        val fps = state.mode.fps
+        when (control) {
+            Control.ISO -> {
+                val row = panelRow()
+                val autoBtn = smallButton(if (state.isoAuto) "AUTO: LIGADO" else "AUTO: DESLIGADO")
+                autoBtn.setOnClickListener {
+                    state.isoAuto = !state.isoAuto
+                    engine.applyState(); showPanel(); refreshStrip()
+                }
+                row.addView(autoBtn)
+                val valueLabel = label("ISO ${state.iso}", 13f, Color.WHITE, bold = true)
+                val valueParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+                valueParams.leftMargin = dp(12)
+                row.addView(valueLabel, valueParams)
+                val row2 = panelRow()
+                row2.addView(
+                    seekBar(CamState.ISO_STEPS.lastIndex, CamState.isoIndexOf(state.iso)) {
+                        state.isoAuto = false
+                        state.iso = CamState.ISO_STEPS[it]
+                        valueLabel.text = "ISO ${state.iso}"
+                        engine.applyState(); refreshStrip()
+                    },
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                )
+            }
+            Control.SHUTTER -> {
+                val row = panelRow()
+                val autoBtn = smallButton(if (state.shutterAuto) "AUTO: LIGADO" else "AUTO: DESLIGADO")
+                autoBtn.setOnClickListener {
+                    state.shutterAuto = !state.shutterAuto
+                    engine.applyState(); showPanel(); refreshStrip()
+                }
+                row.addView(autoBtn)
+                val kindBtn = smallButton(
+                    if (state.shutterKind == ShutterKind.ANGLE) "MODO: ANGULO" else "MODO: VELOCIDADE"
+                )
+                kindBtn.setOnClickListener {
+                    state.shutterAuto = false
+                    state.shutterKind =
+                        if (state.shutterKind == ShutterKind.ANGLE) ShutterKind.SPEED
+                        else ShutterKind.ANGLE
+                    engine.applyState(); showPanel(); refreshStrip()
+                }
+                val kindParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+                kindParams.leftMargin = dp(8)
+                row.addView(kindBtn, kindParams)
+                val valueLabel = label("", 13f, Color.WHITE, bold = true)
+                val valueParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+                valueParams.leftMargin = dp(12)
+                row.addView(valueLabel, valueParams)
+                fun updateLabel() {
+                    val effective = CamState.formatShutterNs(state.manualExposureNs(fps))
+                    valueLabel.text = when (state.shutterKind) {
+                        ShutterKind.ANGLE ->
+                            "${CamState.formatAngle(state.angleDeg)}° = $effective a ${fps}p"
+                        ShutterKind.SPEED ->
+                            "${CamState.SPEED_STEPS[state.speedIndex].first} (efetivo $effective)"
+                    }
+                }
+                updateLabel()
+                val row2 = panelRow()
+                if (state.shutterKind == ShutterKind.ANGLE) {
+                    row2.addView(
+                        seekBar(
+                            CamState.ANGLE_STEPS.lastIndex,
+                            CamState.angleIndexOf(state.angleDeg)
+                        ) {
+                            state.shutterAuto = false
+                            state.angleDeg = CamState.ANGLE_STEPS[it]
+                            updateLabel(); engine.applyState(); refreshStrip()
+                        },
+                        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    )
+                } else {
+                    row2.addView(
+                        seekBar(CamState.SPEED_STEPS.lastIndex, state.speedIndex) {
+                            state.shutterAuto = false
+                            state.speedIndex = it
+                            updateLabel(); engine.applyState(); refreshStrip()
+                        },
+                        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    )
+                }
+            }
+            Control.WB -> {
+                val row = panelRow()
+                val autoBtn = smallButton(if (state.wbAuto) "AUTO: LIGADO" else "AUTO: DESLIGADO")
+                autoBtn.setOnClickListener {
+                    state.wbAuto = !state.wbAuto
+                    engine.applyState(); showPanel(); refreshStrip()
+                }
+                row.addView(autoBtn)
+                val valueLabel = label("${state.kelvin} K", 13f, Color.WHITE, bold = true)
+                val valueParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+                valueParams.leftMargin = dp(12)
+                row.addView(valueLabel, valueParams)
+                val row2 = panelRow()
+                row2.addView(label("K", 11f, MUTED))
+                row2.addView(
+                    seekBar(114, (state.kelvin - 2300) / 50) {
+                        state.wbAuto = false
+                        state.kelvin = 2300 + it * 50
+                        valueLabel.text = "${state.kelvin} K"
+                        engine.applyState(); refreshStrip()
+                    },
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                )
+                val row3 = panelRow()
+                row3.addView(label("TINT", 11f, MUTED))
+                row3.addView(
+                    seekBar(200, state.tint + 100) {
+                        state.wbAuto = false
+                        state.tint = it - 100
+                        engine.applyState()
+                    },
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                )
+                val row4 = panelRow()
+                for ((presetName, presetK) in CamState.WB_PRESETS) {
+                    val chip = smallButton("$presetName ${presetK}")
+                    chip.setOnClickListener {
+                        state.wbAuto = false
+                        state.kelvin = presetK
+                        engine.applyState(); showPanel(); refreshStrip()
+                    }
+                    val chipParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                    chipParams.rightMargin = dp(6)
+                    row4.addView(chip, chipParams)
+                }
+            }
+            Control.FOCUS -> {
+                val row = panelRow()
+                val modes = listOf(
+                    "AF CONTINUO" to FocusMode.CONTINUOUS,
+                    "TOQUE" to FocusMode.TOUCH,
+                    "MANUAL" to FocusMode.MANUAL
+                )
+                for ((modeName, focusMode) in modes) {
+                    val chip = smallButton(
+                        if (state.focusMode == focusMode) "[$modeName]" else modeName
+                    )
+                    chip.setOnClickListener {
+                        state.focusMode = focusMode
+                        engine.applyState(); showPanel(); refreshStrip()
+                    }
+                    val chipParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                    chipParams.rightMargin = dp(6)
+                    row.addView(chip, chipParams)
+                }
+                val valueLabel = label(
+                    CamState.formatFocusMeters(state.focusDiopters),
+                    13f, Color.WHITE, bold = true
+                )
+                val valueParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+                valueParams.leftMargin = dp(12)
+                row.addView(valueLabel, valueParams)
+                val row2 = panelRow()
+                row2.addView(
+                    seekBar(100, (state.focusDiopters * 10).roundToInt()) {
+                        state.focusMode = FocusMode.MANUAL
+                        state.focusDiopters = it / 10f
+                        valueLabel.text = CamState.formatFocusMeters(state.focusDiopters)
+                        engine.applyState(); refreshStrip()
+                    },
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                )
+            }
+            Control.EV -> {
+                val row = panelRow()
+                val valueLabel = label(
+                    String.format(Locale.US, "EV %+.1f", state.ev),
+                    13f, Color.WHITE, bold = true
+                )
+                row.addView(valueLabel)
+                val note = label(
+                    "  (so age com ISO ou obturador em AUTO; faixa do aparelho: +-2)",
+                    11f, MUTED
+                )
+                row.addView(note)
+                val row2 = panelRow()
+                row2.addView(
+                    seekBar(40, ((state.ev + 2f) * 10).roundToInt()) {
+                        state.ev = it / 10f - 2f
+                        valueLabel.text =
+                            String.format(Locale.US, "EV %+.1f", state.ev)
+                        engine.applyState(); refreshStrip()
+                    },
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                )
+            }
+            Control.ZOOM -> {
+                val row = panelRow()
+                val valueLabel = label(
+                    String.format(Locale.US, "%.1fx", state.zoomRatio),
+                    13f, Color.WHITE, bold = true
+                )
+                row.addView(valueLabel)
+                for (chipRatio in floatArrayOf(0.6f, 1f, 2f, 5f, 10f)) {
+                    val chip = smallButton(
+                        String.format(Locale.US, "%.1fx", chipRatio)
+                    )
+                    chip.setOnClickListener {
+                        state.zoomRatio = chipRatio
+                        engine.applyState(); showPanel(); refreshStrip()
+                    }
+                    val chipParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                    chipParams.leftMargin = dp(6)
+                    row.addView(chip, chipParams)
+                }
+                val row2 = panelRow()
+                val minLog = ln(0.6)
+                val maxLog = ln(10.0)
+                val progress = ((ln(state.zoomRatio.toDouble()) - minLog) /
+                    (maxLog - minLog) * 100).roundToInt()
+                row2.addView(
+                    seekBar(100, progress) {
+                        val ratio = kotlin.math.exp(
+                            minLog + (maxLog - minLog) * it / 100.0
+                        ).toFloat()
+                        state.zoomRatio = ratio
+                        valueLabel.text = String.format(Locale.US, "%.1fx", ratio)
+                        engine.applyState(); refreshStrip()
+                    },
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                )
             }
         }
     }
 
-    private fun appendSection(section: String) {
-        runOnUiThread {
-            if (report.isNotEmpty() && !report.endsWith("\n")) report.append("\n")
-            report.append(section)
-            if (!section.endsWith("\n")) report.append("\n")
-            reportText.text = report.toString()
-            setStatus("Teste concluido e somado ao relatorio.")
+    // ---------------------------------------------------------------
+    // Atualizacao de textos
+    // ---------------------------------------------------------------
+    private fun refreshTop() {
+        val mode = state.mode
+        val codec = if (mode.hevc) "H.265" else "H.264"
+        modeButton.text = "${mode.label} · $codec · ${mode.bitrateMbps} Mbps"
+    }
+
+    private fun refreshStrip() {
+        val fps = state.mode.fps
+        val readback = lastReadback
+        cellValues[Control.ISO]?.text =
+            if (state.isoAuto) (readback?.iso?.toString() ?: "AUTO") else state.iso.toString()
+        cellValues[Control.SHUTTER]?.text =
+            if (state.shutterAuto) {
+                readback?.exposureNs?.let { CamState.formatShutterNs(it) } ?: "AUTO"
+            } else {
+                state.shutterLabel(fps)
+            }
+        cellValues[Control.WB]?.text =
+            if (state.wbAuto) "AUTO" else "${state.kelvin}K"
+        cellValues[Control.FOCUS]?.text = when (state.focusMode) {
+            FocusMode.CONTINUOUS ->
+                readback?.focusDiopters?.let { CamState.formatFocusMeters(it) } ?: "AF-C"
+            FocusMode.TOUCH -> "TOQUE"
+            FocusMode.MANUAL -> CamState.formatFocusMeters(state.focusDiopters)
         }
-    }
-
-    private fun setStatus(message: String) {
-        runOnUiThread { statusText.text = message }
-    }
-
-    private fun saveReport(): File {
-        val file = File(documentsDir(), "relatorio-fase0-dxcam.txt")
-        file.writeText(report.toString())
-        reportFile = file
-        setStatus("Relatorio salvo: ${file.absolutePath}")
-        return file
-    }
-
-    private fun shareReport() {
-        val file = saveReport()
-        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            putExtra(Intent.EXTRA_SUBJECT, "DX Cam - Relatorio da Fase 0")
-            putExtra(
-                Intent.EXTRA_TEXT,
-                "Segue o relatorio da Fase 0 do DX Cam (${android.os.Build.MODEL})."
+        cellValues[Control.EV]?.text = String.format(Locale.US, "%+.1f", state.ev)
+        cellValues[Control.ZOOM]?.text =
+            "${(24 * state.zoomRatio).roundToInt()} mm"
+        for (control in Control.values()) {
+            val valueView = cellValues[control] ?: continue
+            val nameView = cellNames[control] ?: continue
+            valueView.setTextColor(
+                when {
+                    isLocked(control) -> AMBER
+                    isManual(control) -> AMBER
+                    selected == control -> Color.CYAN
+                    else -> Color.WHITE
+                }
             )
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            nameView.text = buildString {
+                append(controlLabel(control))
+                if (isLocked(control)) append(" · TRAV")
+                else if (isManual(control)) append(" · MAN")
+            }
+            nameView.setTextColor(if (selected == control) Color.CYAN else MUTED)
         }
-        startActivity(Intent.createChooser(intent, "Compartilhar relatorio"))
+    }
+
+    private fun updateSpace() {
+        try {
+            val free = StatFs(Environment.getExternalStorageDirectory().path)
+                .availableBytes
+            spaceText.text = String.format(
+                Locale.US, "%.0f GB livres", free / 1_000_000_000.0
+            )
+        } catch (e: Exception) {
+            spaceText.text = ""
+        }
+    }
+
+    private fun showStatus(message: String) {
+        statusText.text = message
+    }
+
+    private fun showWarning(message: String) {
+        warningText.text = message
+        warningText.visibility = View.VISIBLE
+        uiHandler.postDelayed({ warningText.visibility = View.GONE }, 4500)
+    }
+
+    // ---------------------------------------------------------------
+    // Modo e gravacao
+    // ---------------------------------------------------------------
+    private fun cycleMode() {
+        if (engine.recording) {
+            showStatus("Troca de modo so com a gravacao parada.")
+            return
+        }
+        val oldMode = state.mode
+        val newIndex = (state.modeIndex + 1) % VideoModes.ALL.size
+        val newMode = VideoModes.ALL[newIndex]
+        if (!state.shutterAuto && state.shutterKind == ShutterKind.SPEED) {
+            val wanted = CamState.SPEED_STEPS[state.speedIndex].second
+            if (wanted > newMode.frameDurationNs) {
+                showWarning(
+                    "Obturador ${CamState.SPEED_STEPS[state.speedIndex].first} nao cabe " +
+                        "em ${newMode.fps}p: ajustado para " +
+                        CamState.formatShutterNs(newMode.frameDurationNs) + "."
+                )
+            }
+        }
+        if (oldMode.hdr != newMode.hdr) {
+            showStatus(
+                if (newMode.hdr) "Modo HDR 10-bit (arquivo BT.2020/HDR)."
+                else "Modo SDR."
+            )
+        }
+        state.modeIndex = newIndex
+        engine.applyState()
+        refreshTop()
+        refreshStrip()
+        if (selected == Control.SHUTTER) showPanel()
+    }
+
+    private fun onRecTapped() {
+        if (!engineOpened) {
+            showStatus("A camera ainda esta abrindo.")
+            return
+        }
+        if (engine.isTransitioning) return
+        if (engine.recording) engine.stopRecording() else engine.startRecording()
+    }
+
+    private fun startTimer() {
+        recordStartMs = SystemClock.elapsedRealtime()
+        timerText.visibility = View.VISIBLE
+        val runnable = object : Runnable {
+            override fun run() {
+                val elapsed = (SystemClock.elapsedRealtime() - recordStartMs) / 1000
+                timerText.text = String.format(
+                    Locale.US, "● REC %02d:%02d", elapsed / 60, elapsed % 60
+                )
+                timerRunnable = this
+                uiHandler.postDelayed(this, 500)
+            }
+        }
+        timerRunnable = runnable
+        uiHandler.post(runnable)
+    }
+
+    private fun stopTimer() {
+        timerRunnable?.let { uiHandler.removeCallbacks(it) }
+        timerRunnable = null
+        timerText.visibility = View.GONE
+    }
+
+    // ---------------------------------------------------------------
+    // CameraEngine.Listener
+    // ---------------------------------------------------------------
+    override fun onReadback(readback: CameraEngine.Readback) {
+        uiHandler.post {
+            lastReadback = readback
+            refreshStrip()
+        }
+    }
+
+    override fun onRecordingChanged(recording: Boolean) {
+        uiHandler.post {
+            if (recording) {
+                recButton.setTextColor(Color.WHITE)
+                recButton.text = "■"
+                showStatus("Gravando em Movies/DXCam.")
+                startTimer()
+            } else {
+                recButton.setTextColor(RED)
+                recButton.text = "●"
+                showStatus("Gravacao salva em Movies/DXCam.")
+                stopTimer()
+                updateSpace()
+            }
+        }
+    }
+
+    override fun onError(message: String) {
+        uiHandler.post {
+            showStatus(message)
+            showWarning(message)
+        }
+    }
+
+    companion object {
+        private val AMBER = Color.rgb(255, 179, 0)
+        private val RED = Color.rgb(255, 59, 48)
+        private val MUTED = Color.rgb(158, 158, 158)
     }
 }

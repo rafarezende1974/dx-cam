@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Fase 0 (diagnostico): le as capacidades reais da camera (Camera2),
-         grava clipes curtos de teste, tira uma foto RAW de teste e mede a
-         escrita no armazenamento. CAMERA e RECORD_AUDIO sao pedidos em
-         tempo de execucao; a leitura de caracteristicas nao precisa deles. -->
+    <!-- DX Cam v1: camera de cinema no Android (Camera2 direto).
+         CAMERA e RECORD_AUDIO sao pedidos em tempo de execucao.
+         Os videos vao para Movies/DXCam pelo MediaStore (sem permissao
+         de armazenamento). O FileProvider abaixo e heranca da Fase 0
+         (compartilhar o relatorio) e segue disponivel. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
@@ -24,7 +25,8 @@
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:exported="true"
-            android:launchMode="singleTask">
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
