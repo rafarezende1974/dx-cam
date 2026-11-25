@@ -157,6 +157,18 @@ class CamState(context: Context) {
     var photoFormat: Int = prefs.getInt("photoFormat", 0)
         set(value) { field = value.coerceIn(0, 2); save() }
 
+    // Etapa 8: rastro (longa exposicao por empilhamento) e time lapse.
+    // O sensor expoe no maximo 1/10 por quadro (Fase 0), entao o rastro
+    // de segundos vem de somar/maximizar muitos quadros de 1/10.
+    var trailDurationSec: Int = prefs.getInt("trailDurationSec", 5)
+        set(value) { field = value.coerceIn(1, 60); save() }
+    // 0 = LUZ (maximo: trilhas de luz), 1 = MOVIMENTO (media: borrao).
+    var trailBlend: Int = prefs.getInt("trailBlend", 0)
+        set(value) { field = value.coerceIn(0, 1); save() }
+    // Segundos entre quadros do time lapse; 0 = desligado.
+    var timelapseSec: Float = prefs.getFloat("timelapseSec", 0f)
+        set(value) { field = value.coerceIn(0f, 60f); save() }
+
     val mode: VideoMode get() = VideoModes.ALL[modeIndex]
 
     /** Bitrate efetivo do modo atual conforme o nivel (sempre visivel). */
@@ -211,6 +223,9 @@ class CamState(context: Context) {
             .putString("lutFiles", lutFiles)
             .putInt("lutActive", lutActive)
             .putInt("photoFormat", photoFormat)
+            .putInt("trailDurationSec", trailDurationSec)
+            .putInt("trailBlend", trailBlend)
+            .putFloat("timelapseSec", timelapseSec)
             .apply()
     }
 

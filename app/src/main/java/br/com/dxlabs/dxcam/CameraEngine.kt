@@ -6,6 +6,7 @@ import android.content.Context
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
+import android.graphics.YuvImage
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -70,6 +71,10 @@ class CameraEngine(
         fun onAnalysisFrame(y: ByteArray, width: Int, height: Int)
         /** Etapa 6: foto salva (JPEG e/ou DNG) no destino atual. */
         fun onPhotoSaved(message: String)
+        /** Etapa 8: progresso do rastro (quadros somados ate agora). */
+        fun onTrailProgress(frames: Int, elapsedMs: Long, totalMs: Long)
+        /** Etapa 8: foto de rastro salva. */
+        fun onTrailSaved(message: String)
     }
 
     data class Readback(
@@ -112,6 +117,22 @@ class CameraEngine(
     private var pendingPhoto: PendingPhoto? = null
 
     val rawSupported: Boolean get() = rawReader != null
+
+    // Etapa 8: rastro por empilhamento e time lapse.
+    @Volatile
+    var trailing: Boolean = false
+        private set
+    private var trailReader: ImageReader? = null
+    private var trailStartMs: Long = 0
+    private var trailDurationMs: Long = 0
+    private var trailFrames: Int = 0
+    private var accY: IntArray? = null
+    private var accU: IntArray? = null
+    private var accV: IntArray? = null
+    private var accWidth: Int = 0
+    private var accHeight: Int = 0
+    /** Duracao de quadro forcada (time lapse); 0 = usar a do modo. */
+    private var frameDurationOverrideNs: Long = 0
 
     private class PendingPhoto(
         val baseName: String,
@@ -279,7 +300,7 @@ class CameraEngine(
      * gravacao recusa (a troca reabriria a sessao do gravador).
      */
     fun setPreviewSurface(surface: Surface): Boolean {
-        if (recording || transitioning) return false
+        if (recording || transitioning || trailing) return false
         previewSurface = surface
         if (device != null) {
             try {
@@ -392,6 +413,16 @@ class CameraEngine(
     }
 
     fun close() {
+        trailing = false
+        frameDurationOverrideNs = 0
+        try {
+            trailReader?.close()
+        } catch (e: Exception) {
+        }
+        trailReader = null
+        accY = null
+        accU = null
+        accV = null
         try {
             session?.close()
         } catch (e: Exception) {
@@ -492,6 +523,7 @@ class CameraEngine(
                         listener.onRecordingChanged(true)
                     } catch (e: Exception) {
                         transitioning = false
+                        frameDurationOverrideNs = 0
                         releaseRecorder()
                         cleanupOutputs(delete = true)
                         listener.onError("Falha ao gravar: ${e.message}")
@@ -535,6 +567,7 @@ class CameraEngine(
                 }
                 transitioning = false
                 if (recorderSurface != null) {
+                    frameDurationOverrideNs = 0
                     releaseRecorder()
                     cleanupOutputs(delete = true)
                     listener.onError("Sessao de gravacao nao configurada.")
@@ -575,20 +608,38 @@ class CameraEngine(
     private fun buildRequest(
         dev: CameraDevice,
         targets: List<Surface>
-    ): CaptureRequest {
+    ): CaptureRequest = buildRequestBuilder(dev, targets).build()
+
+    private fun buildRequestBuilder(
+        dev: CameraDevice,
+        targets: List<Surface>
+    ): CaptureRequest.Builder {
         val mode = state.mode
         val builder = dev.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
         for (target in targets) builder.addTarget(target)
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
 
         // --- Exposicao ---
-        val frameNs = mode.frameDurationNs
+        // Time lapse (Etapa 8): o quadro dura o intervalo entre capturas.
+        val frameNs = if (frameDurationOverrideNs > 0) {
+            frameDurationOverrideNs
+        } else {
+            mode.frameDurationNs
+        }
         if (state.isoAuto && state.shutterAuto) {
             builder.set(
                 CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON
             )
+            val targetFps = if (frameDurationOverrideNs > 0) {
+                maxOf(
+                    1,
+                    (1_000_000_000.0 / frameDurationOverrideNs).toInt()
+                )
+            } else {
+                mode.fps
+            }
             builder.set(
-                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(mode.fps, mode.fps)
+                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(targetFps, targetFps)
             )
             val steps = CamState.evStepsFor(state.ev, evStep)
                 .coerceIn(evRange.lower, evRange.upper)
@@ -663,7 +714,7 @@ class CameraEngine(
 
         // --- Zoom ---
         builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, state.zoomRatio)
-        return builder.build()
+        return builder
     }
 
     private val resultCallback = object : CameraCaptureSession.CaptureCallback() {
@@ -747,6 +798,10 @@ class CameraEngine(
     // Foto (Etapa 6): JPEG + RAW (DNG) com os controles da previa
     // ---------------------------------------------------------------
     fun capturePhoto(displayRotationDegrees: Int) {
+        if (trailing) {
+            listener.onInfo("Rastro em andamento: toque em FOTO para parar e salvar.")
+            return
+        }
         if (recording || transitioning) {
             listener.onInfo("Foto so com a gravacao parada.")
             return
@@ -977,6 +1032,260 @@ class CameraEngine(
     }
 
     // ---------------------------------------------------------------
+    // Etapa 8: rastro (longa exposicao por empilhamento de quadros)
+    // ---------------------------------------------------------------
+    private val trailImageListener = ImageReader.OnImageAvailableListener { reader ->
+        val image = try {
+            reader.acquireLatestImage()
+        } catch (e: Exception) {
+            null
+        } ?: return@OnImageAvailableListener
+        var shouldFinish = false
+        try {
+            if (!trailing) return@OnImageAvailableListener
+            accumulateTrailFrame(image)
+            trailFrames += 1
+            val elapsed = System.currentTimeMillis() - trailStartMs
+            listener.onTrailProgress(trailFrames, elapsed, trailDurationMs)
+            if (elapsed >= trailDurationMs) shouldFinish = true
+        } catch (e: Exception) {
+            // Quadro ilegivel: ignora e segue somando.
+        } finally {
+            try {
+                image.close()
+            } catch (e: Exception) {
+            }
+        }
+        if (shouldFinish) stopTrail(save = true)
+    }
+
+    private fun accumulateTrailFrame(image: Image) {
+        val width = image.width
+        val height = image.height
+        if (accY == null || accWidth != width || accHeight != height) {
+            accWidth = width
+            accHeight = height
+            accY = IntArray(width * height)
+            accU = IntArray(width / 2 * (height / 2)) { 128 }
+            accV = IntArray(width / 2 * (height / 2)) { 128 }
+            trailFrames = 0
+        }
+        val sumY = accY!!
+        val sumU = accU!!
+        val sumV = accV!!
+        val average = state.trailBlend == 1
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        val chromaWidth = width / 2
+        fun chromaValue(plane: Image.Plane, cx: Int, cy: Int): Int =
+            plane.buffer.get(cy * plane.rowStride + cx * plane.pixelStride)
+                .toInt() and 0xFF
+        for (row in 0 until height) {
+            val yRowOffset = row * yPlane.rowStride
+            val chromaRow = row / 2
+            for (col in 0 until width) {
+                val y = yPlane.buffer.get(yRowOffset + col * yPlane.pixelStride)
+                    .toInt() and 0xFF
+                val index = row * width + col
+                if (average) {
+                    sumY[index] += y
+                } else if (y > sumY[index]) {
+                    // LUZ: o pixel mais claro vence, com a cor dele.
+                    sumY[index] = y
+                    val chromaIndex = chromaRow * chromaWidth + col / 2
+                    sumU[chromaIndex] = chromaValue(uPlane, col / 2, chromaRow)
+                    sumV[chromaIndex] = chromaValue(vPlane, col / 2, chromaRow)
+                }
+            }
+        }
+        if (average) {
+            for (cy in 0 until height / 2) {
+                for (cx in 0 until chromaWidth) {
+                    val index = cy * chromaWidth + cx
+                    sumU[index] += chromaValue(uPlane, cx, cy)
+                    sumV[index] += chromaValue(vPlane, cx, cy)
+                }
+            }
+        }
+    }
+
+    fun startTrail() {
+        if (trailing) return
+        if (recording || transitioning) {
+            listener.onInfo("Rastro so com a gravacao parada.")
+            return
+        }
+        if (device == null || previewSurface == null) {
+            listener.onError("Camera ainda nao esta pronta.")
+            return
+        }
+        if (pendingPhoto != null) {
+            listener.onInfo("Aguarde a foto anterior salvar.")
+            return
+        }
+        val map = chars?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888).orEmpty()
+        val size = yuvSizes.filter { it.width <= 1920 }
+            .maxByOrNull { it.width * it.height }
+            ?: yuvSizes.minByOrNull { it.width * it.height }
+        if (size == null) {
+            listener.onError("Este aparelho nao expoe quadros para o rastro.")
+            return
+        }
+        try {
+            val reader = ImageReader.newInstance(
+                size.width, size.height, ImageFormat.YUV_420_888, 3
+            )
+            reader.setOnImageAvailableListener(trailImageListener, bgHandler)
+            trailReader = reader
+        } catch (e: Exception) {
+            listener.onError("Falha ao preparar o rastro: ${e.message}")
+            return
+        }
+        accY = null
+        accU = null
+        accV = null
+        trailFrames = 0
+        trailDurationMs = state.trailDurationSec * 1000L
+        trailStartMs = System.currentTimeMillis()
+        trailing = true
+        listener.onInfo(
+            "Rastro somando: cada quadro e 1/10 (o maximo do sensor); " +
+                "o resultado junta ${state.trailDurationSec}s. " +
+                "Monitoramento pausado durante o rastro."
+        )
+        createTrailSession()
+    }
+
+    /** Para o rastro; com save=true grava o que ja somou. */
+    fun stopTrail(save: Boolean) {
+        if (!trailing) return
+        trailing = false
+        val frames = trailFrames
+        val width = accWidth
+        val height = accHeight
+        val sumY = accY
+        val sumU = accU
+        val sumV = accV
+        accY = null
+        accU = null
+        accV = null
+        try {
+            trailReader?.close()
+        } catch (e: Exception) {
+        }
+        trailReader = null
+        if (save && frames > 0 && sumY != null && sumU != null && sumV != null) {
+            saveTrailImage(sumY, sumU, sumV, width, height, frames)
+        }
+        createSession(null)
+    }
+
+    private fun saveTrailImage(
+        sumY: IntArray,
+        sumU: IntArray,
+        sumV: IntArray,
+        width: Int,
+        height: Int,
+        frames: Int
+    ) {
+        try {
+            val average = state.trailBlend == 1
+            val count = if (average) maxOf(1, frames) else 1
+            val nv21 = ByteArray(width * height + width * height / 2)
+            for (index in sumY.indices) {
+                val value = if (average) sumY[index] / count else sumY[index]
+                nv21[index] = value.coerceIn(0, 255).toByte()
+            }
+            val chromaWidth = width / 2
+            var offset = width * height
+            for (cy in 0 until height / 2) {
+                for (cx in 0 until chromaWidth) {
+                    val index = cy * chromaWidth + cx
+                    val v = if (average) sumV[index] / count else sumV[index]
+                    val u = if (average) sumU[index] / count else sumU[index]
+                    nv21[offset] = v.coerceIn(0, 255).toByte()
+                    nv21[offset + 1] = u.coerceIn(0, 255).toByte()
+                    offset += 2
+                }
+            }
+            val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            val bytes = java.io.ByteArrayOutputStream().use { stream ->
+                yuvImage.compressToJpeg(Rect(0, 0, width, height), 92, stream)
+                stream.toByteArray()
+            }
+            val name = buildBaseName() + "_rastro.jpg"
+            val out = createImageOutput(name, "image/jpeg")
+                ?: throw IllegalStateException("sem destino para a foto")
+            FileOutputStream(out.pfd.fileDescriptor).use { it.write(bytes) }
+            out.finalize()
+            try {
+                out.pfd.close()
+            } catch (e: Exception) {
+            }
+            listener.onTrailSaved(
+                "Foto de rastro salva: $name ($frames quadros, " +
+                    "${state.trailDurationSec}s) " +
+                    if (state.destSsd) "(SSD)" else "(Pictures/DXCam)"
+            )
+        } catch (e: Exception) {
+            listener.onError("Falha ao salvar o rastro: ${e.message}")
+        }
+    }
+
+    private fun createTrailSession() {
+        val dev = device ?: return
+        val preview = previewSurface ?: return
+        val trailSurface = trailReader?.surface ?: return
+        val targets = listOf(preview, trailSurface)
+        try {
+            session?.close()
+            session = null
+            dev.createCaptureSession(
+                targets,
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(newSession: CameraCaptureSession) {
+                        session = newSession
+                        try {
+                            val builder = buildRequestBuilder(dev, targets)
+                            // Cada quadro no maximo do sensor: 1/10.
+                            builder.set(
+                                CaptureRequest.SENSOR_FRAME_DURATION, 100_000_000L
+                            )
+                            if (state.isoAuto && state.shutterAuto) {
+                                builder.set(
+                                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                    Range(10, 10)
+                                )
+                            } else {
+                                builder.set(
+                                    CaptureRequest.SENSOR_EXPOSURE_TIME, 100_000_000L
+                                )
+                            }
+                            newSession.setRepeatingRequest(
+                                builder.build(), resultCallback, bgHandler
+                            )
+                        } catch (e: Exception) {
+                            listener.onError("Falha no rastro: ${e.message}")
+                            stopTrail(save = false)
+                        }
+                    }
+
+                    override fun onConfigureFailed(failed: CameraCaptureSession) {
+                        listener.onError("Sessao do rastro nao configurada.")
+                        stopTrail(save = false)
+                    }
+                },
+                bgHandler
+            )
+        } catch (e: Exception) {
+            listener.onError("Falha ao iniciar o rastro: ${e.message}")
+            stopTrail(save = false)
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Gravacao (Etapa 3): destinos, nomeacao e divisao automatica
     // ---------------------------------------------------------------
     private fun buildBaseName(): String {
@@ -1051,6 +1360,10 @@ class CameraEngine(
 
     fun startRecording() {
         if (recording || transitioning) return
+        if (trailing) {
+            listener.onError("Termine o rastro antes de gravar.")
+            return
+        }
         val mode = state.mode
         transitioning = true
         recordBaseName = buildBaseName()
@@ -1085,6 +1398,13 @@ class CameraEngine(
             )
             rec.setVideoSize(mode.width, mode.height)
             rec.setVideoFrameRate(mode.fps)
+            // Etapa 8: time lapse — o gravador amostra 1 quadro a cada
+            // intervalo e a sessao roda com o quadro nesse ritmo.
+            if (state.timelapseSec > 0f) {
+                rec.setCaptureRate(1.0 / state.timelapseSec)
+                frameDurationOverrideNs =
+                    (state.timelapseSec * 1_000_000_000.0).toLong()
+            }
             rec.setVideoEncodingBitRate(state.effectiveBitrateMbps() * 1_000_000)
             rec.setOrientationHint(sensorOrientation)
             rec.setOutputFile(first.pfd.fileDescriptor)
@@ -1099,6 +1419,7 @@ class CameraEngine(
             rec.prepare()
         } catch (e: Exception) {
             transitioning = false
+            frameDurationOverrideNs = 0
             releaseRecorder()
             cleanupOutputs(delete = true)
             listener.onError("Falha ao preparar a gravacao: ${e.message}")
@@ -1169,6 +1490,7 @@ class CameraEngine(
         }
         outputs.clear()
         currentOutput = null
+        frameDurationOverrideNs = 0
         listener.onRecordingChanged(false)
         createSession(null)
     }

@@ -1783,7 +1783,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "-"
         }
         val about = label(
-            "DX Cam v0.8.0-midia — DX Labs\n" +
+            "DX Cam v0.9.0-rastro — DX Labs\n" +
                 "Camera de cinema para o S24: video manual, foto RAW, " +
                 "monitoramento e LUT so na previa.\n" +
                 "Espaco livre no aparelho: $free.",
@@ -2332,6 +2332,11 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     // Etapa 6: foto (JPEG + RAW/DNG) com os controles da previa
     // ---------------------------------------------------------------
     private fun capturePhoto() {
+        if (engine.trailing) {
+            engine.stopTrail(save = true)
+            showStatus("Rastro encerrado: salvando o que somou.")
+            return
+        }
         if (engine.recording) {
             showStatus("Foto so com a gravacao parada.")
             return
@@ -2402,6 +2407,63 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         )
         note.setPadding(0, dp(6), 0, 0)
         panel.addView(note)
+        // Etapa 8: rastro por empilhamento (o sensor expoe no maximo
+        // 1/10 por quadro; segundos de rastro = muitos quadros somados).
+        panelTitle("RASTRO — longa exposição por empilhamento")
+        val durationRow = panelRow()
+        for (seconds in listOf(1, 2, 5, 10, 20, 30)) {
+            val chip = chipButton(
+                "${seconds}s", state.trailDurationSec == seconds
+            ) {
+                state.trailDurationSec = seconds
+                showPanel()
+            }
+            val chipParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            chipParams.rightMargin = dp(6)
+            durationRow.addView(chip, chipParams)
+        }
+        val blendRow = panelRow()
+        val luzChip = chipButton("LUZ (trilhas)", state.trailBlend == 0) {
+            state.trailBlend = 0
+            showPanel()
+        }
+        blendRow.addView(luzChip)
+        val moveChip = chipButton("MOVIMENTO (borrão)", state.trailBlend == 1) {
+            state.trailBlend = 1
+            showPanel()
+        }
+        val moveParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        moveParams.leftMargin = dp(6)
+        blendRow.addView(moveChip, moveParams)
+        val startRow = panelRow()
+        val startButton = smallButton(
+            if (engine.trailing) "PARAR E SALVAR O RASTRO" else "INICIAR RASTRO"
+        )
+        startButton.setOnClickListener {
+            if (engine.trailing) {
+                engine.stopTrail(save = true)
+            } else {
+                panelKind = PanelKind.NONE
+                showPanel()
+                engine.startTrail()
+            }
+        }
+        startRow.addView(startButton)
+        val trailNote = label(
+            "LUZ: o pixel mais claro vence — trilhas de farol, escrita " +
+                "com luz, fogos. MOVIMENTO: media dos quadros — agua " +
+                "sedosa e borrao de movimento. Durante o rastro, tocar " +
+                "em FOTO para e salva. Sai em JPEG ate 1920px de largura.",
+            11f, MUTED
+        )
+        trailNote.setPadding(0, dp(4), 0, 0)
+        panel.addView(trailNote)
     }
 
     // ---------------------------------------------------------------
@@ -2732,6 +2794,44 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         )
         hint.setPadding(0, dp(4), 0, dp(2))
         panel.addView(hint)
+        // Etapa 8: time lapse (1 quadro a cada intervalo; toca no fps do modo).
+        panelTitle("TIME LAPSE — intervalo entre quadros")
+        val tlRow = panelRow()
+        val tlOptions = listOf(
+            0f to "DESLIGADO",
+            0.5f to "0,5s",
+            1f to "1s",
+            2f to "2s",
+            5f to "5s",
+            10f to "10s",
+            30f to "30s"
+        )
+        for ((seconds, labelText) in tlOptions) {
+            val chip = chipButton(labelText, state.timelapseSec == seconds) {
+                if (engine.recording) {
+                    showStatus("Time lapse so muda com a gravacao parada.")
+                } else {
+                    state.timelapseSec = seconds
+                    showPanel()
+                    if (seconds > 0f) {
+                        val factor = (state.mode.fps * seconds).roundToInt()
+                        showStatus(
+                            "Time lapse $labelText: video ${factor}x mais " +
+                                "rapido. A previa fica em ritmo de quadro " +
+                                "durante a gravacao."
+                        )
+                    } else {
+                        showStatus("Time lapse desligado.")
+                    }
+                }
+            }
+            val chipParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            chipParams.rightMargin = dp(6)
+            tlRow.addView(chip, chipParams)
+        }
     }
 
     // ---------------------------------------------------------------
@@ -3063,7 +3163,13 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 peakDb = -60f
                 timecodeText.setTextColor(RED)
                 showStatus(
-                    if (state.destSsd) "Gravando no SSD." else "Gravando em Movies/DXCam."
+                    when {
+                        state.timelapseSec > 0f ->
+                            "Time lapse ${state.timelapseSec}s gravando " +
+                                if (state.destSsd) "no SSD." else "em Movies/DXCam."
+                        state.destSsd -> "Gravando no SSD."
+                        else -> "Gravando em Movies/DXCam."
+                    }
                 )
                 startHudTick()
             } else {
@@ -3088,6 +3194,31 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     }
 
     override fun onPhotoSaved(message: String) {
+        uiHandler.post { showStatus(message) }
+    }
+
+    private var lastTrailStatusAt: Long = 0
+
+    override fun onTrailProgress(frames: Int, elapsedMs: Long, totalMs: Long) {
+        val now = System.currentTimeMillis()
+        if (now - lastTrailStatusAt < 900) return
+        lastTrailStatusAt = now
+        val percent = if (totalMs > 0) {
+            (elapsedMs * 100 / totalMs).coerceIn(0, 100)
+        } else {
+            0
+        }
+        uiHandler.post {
+            if (engine.trailing) {
+                showStatus(
+                    "Rastro: $percent% · $frames quadros somados — " +
+                        "toque em FOTO para parar e salvar."
+                )
+            }
+        }
+    }
+
+    override fun onTrailSaved(message: String) {
         uiHandler.post { showStatus(message) }
     }
 
