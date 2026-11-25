@@ -11,6 +11,8 @@ Tempo total: uns 10 minutos. Faça com o celular **fora da capinha grossa** e, s
 
 ## Passo a passo
 
+**Rode um teste por vez e espere o status voltar antes de tocar no próximo botão.** Se um teste travar, a v0.1.1 encerra sozinha em até ~55 s e registra no relatório em qual etapa travou — nesse caso, feche e reabra o app e rode só aquele teste de novo.
+
 1. **Diagnóstico automático** — ao abrir, o app já lê o aparelho e monta o relatório na tela. Confira se aparecem as câmeras traseiras com ISO, obturador e RAW.
 2. **Gravar teste 4K 24p H.265 (30 s)** — aponte para uma cena com luz variada (uma janela ajuda) e toque no botão. Não feche o app. Ao fim, a análise do arquivo entra no relatório.
 3. **Gravar teste 1080p 60p H.264 (30 s)** — mesma cena.

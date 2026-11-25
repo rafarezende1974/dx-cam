@@ -31,17 +31,26 @@ import java.util.Locale
 /**
  * DX Cam - Fase 0: testes que abrem a camera e gravam de verdade.
  *
- * - recordTest: grava um clipe curto (30 s) sem previa, so com a superficie
- *   do MediaRecorder, e depois analisa o arquivo gerado (codec, cor,
- *   fps aproximado por contagem de amostras, bitrate real). E assim que a
- *   Fase 0 prova se o "10-bit" declarado sai no arquivo.
+ * - recordTest: grava um clipe curto (30 s) e depois analisa o arquivo
+ *   gerado (codec, cor, fps aproximado por contagem de amostras, bitrate
+ *   real). E assim que a Fase 0 prova se o "10-bit" declarado sai no
+ *   arquivo.
  * - captureRawTest: captura RAW (DNG) + JPEG com os mesmos tamanhos que a
  *   sonda leu e salva os dois arquivos para abrir no Lightroom/Premiere.
  * - writeSpeedTest: escreve 128 MB em cada volume (interno e SSD/cartao,
  *   se houver) e mede MB/s sustentado.
  *
- * Tudo roda no Handler de fundo da Activity; os resultados voltam como
- * texto pronto para entrar no relatorio.
+ * v0.1.1-diag - correcao do travamento da v0.1.0: no S24, a sessao de
+ * gravacao so com a superficie do MediaRecorder nunca chamou
+ * onConfigured/onConfigureFailed, o teste ficou "ocupado" para sempre e
+ * todos os outros testes responderam OCUPADO sem rodar. Correcoes:
+ * 1) toda sessao agora tem tambem uma superficie de previa (ImageReader
+ *    YUV 1280x720), como no app real, que sempre tera previa;
+ * 2) cada teste tem um vigia (watchdog) armado desde o inicio: se travar
+ *    em qualquer etapa, ele encerra, limpa tudo e registra no relatorio
+ *    em qual etapa travou;
+ * 3) nenhum caminho sai em silencio: erro, desconexao e excecao ao abrir
+ *    a camera tambem viram secao do relatorio.
  */
 class CameraTester(
     private val context: Context,
@@ -56,6 +65,16 @@ class CameraTester(
     private var cameraDevice: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var recorder: MediaRecorder? = null
+    private var previewReader: ImageReader? = null
+    private var rawReaderRef: ImageReader? = null
+    private var jpegReaderRef: ImageReader? = null
+
+    // Estado do teste ativo (um por vez, garantido pelo busy).
+    private var stage: String = ""
+    private var finished: Boolean = true
+    private var activeTitle: String = ""
+    private var activeDone: ((String) -> Unit)? = null
+    private var watchdog: Runnable? = null
 
     companion object {
         fun batterySnapshot(context: Context): String {
@@ -70,7 +89,41 @@ class CameraTester(
         }
     }
 
-    private fun cleanupCamera() {
+    private fun beginTest(title: String, timeoutMs: Long, done: (String) -> Unit) {
+        busy = true
+        finished = false
+        stage = "iniciando"
+        activeTitle = title
+        activeDone = done
+        val runnable = Runnable {
+            if (!finished) {
+                val text = "\n=== $activeTitle ===\n" +
+                    "FALHA: o teste travou na etapa \"$stage\" e foi encerrado pelo vigia " +
+                    "apos ${timeoutMs / 1000} s. Feche e reabra o app e rode so este teste."
+                finishTest(text)
+            }
+        }
+        watchdog = runnable
+        bgHandler.postDelayed(runnable, timeoutMs)
+    }
+
+    private fun finishTest(text: String) {
+        if (finished) return
+        finished = true
+        watchdog?.let { bgHandler.removeCallbacks(it) }
+        watchdog = null
+        cleanupAll()
+        busy = false
+        val done = activeDone
+        activeDone = null
+        done?.invoke(text)
+    }
+
+    private fun failBusy(title: String, done: (String) -> Unit) {
+        done("\n=== $title ===\nOCUPADO: outro teste em andamento.")
+    }
+
+    private fun cleanupAll() {
         try {
             session?.close()
         } catch (e: Exception) {
@@ -87,6 +140,27 @@ class CameraTester(
         } catch (e: Exception) {
         }
         recorder = null
+        for (reader in listOf(previewReader, rawReaderRef, jpegReaderRef)) {
+            try {
+                reader?.close()
+            } catch (e: Exception) {
+            }
+        }
+        previewReader = null
+        rawReaderRef = null
+        jpegReaderRef = null
+    }
+
+    private fun newPreviewReader(): ImageReader {
+        val reader = ImageReader.newInstance(1280, 720, ImageFormat.YUV_420_888, 2)
+        reader.setOnImageAvailableListener({ r ->
+            try {
+                r.acquireLatestImage()?.close()
+            } catch (e: Exception) {
+            }
+        }, bgHandler)
+        previewReader = reader
+        return reader
     }
 
     // ---------------------------------------------------------------
@@ -105,16 +179,17 @@ class CameraTester(
         status: (String) -> Unit,
         done: (String) -> Unit
     ) {
+        val title = "TESTE DE GRAVACAO $label"
         if (busy) {
-            done("=== TESTE DE GRAVACAO $label ===\nOCUPADO: outro teste em andamento.")
+            failBusy(title, done)
             return
         }
+        beginTest(title, durationMs + 25_000, done)
         val cameraId = CameraProbe.pickMainBackCameraId(manager)
         if (cameraId == null) {
-            done("=== TESTE DE GRAVACAO $label ===\nSem camera traseira.")
+            finishTest("\n=== $title ===\nSem camera traseira.")
             return
         }
-        busy = true
         outDir.mkdirs()
         val file = File(outDir, "teste_$label.mp4")
         if (file.exists()) file.delete()
@@ -124,6 +199,7 @@ class CameraTester(
         val rec = MediaRecorder(context)
         recorder = rec
         try {
+            stage = "preparando o gravador"
             val chars = manager.getCameraCharacteristics(cameraId)
             val orientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
             rec.setAudioSource(MediaRecorder.AudioSource.MIC)
@@ -140,91 +216,102 @@ class CameraTester(
             rec.setOutputFile(file.absolutePath)
             rec.prepare()
         } catch (e: Exception) {
-            cleanupCamera()
-            busy = false
-            done("=== TESTE DE GRAVACAO $label ===\nFALHA ao preparar: ${e.message}")
+            finishTest("\n=== $title ===\nFALHA ao preparar: ${e.message}")
             return
         }
 
         val surface: Surface = rec.surface
-        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-            override fun onOpened(device: CameraDevice) {
-                cameraDevice = device
-                device.createCaptureSession(
-                    listOf(surface),
-                    object : CameraCaptureSession.StateCallback() {
-                        override fun onConfigured(newSession: CameraCaptureSession) {
-                            session = newSession
-                            try {
-                                val builder =
-                                    device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-                                builder.addTarget(surface)
-                                builder.set(
-                                    CaptureRequest.CONTROL_MODE,
-                                    CaptureRequest.CONTROL_MODE_AUTO
-                                )
-                                builder.set(
-                                    CaptureRequest.CONTROL_AF_MODE,
-                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
-                                )
-                                builder.set(
-                                    CaptureRequest.CONTROL_AE_MODE,
-                                    CaptureRequest.CONTROL_AE_MODE_ON
-                                )
-                                newSession.setRepeatingRequest(
-                                    builder.build(), null, bgHandler
-                                )
-                                rec.start()
-                            } catch (e: Exception) {
-                                cleanupCamera()
-                                busy = false
-                                done(
-                                    "=== TESTE DE GRAVACAO $label ===\n" +
-                                        "FALHA ao iniciar: ${e.message}"
-                                )
-                                return
-                            }
-                            bgHandler.postDelayed({
-                                stopRecording(
-                                    label, file, width, height, fps,
-                                    bitrateMbps, batteryStart, done
-                                )
-                            }, durationMs)
-                        }
+        val preview = newPreviewReader()
+        stage = "abrindo a camera"
+        status("Abrindo a camera para o teste $label...")
+        try {
+            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(device: CameraDevice) {
+                    cameraDevice = device
+                    stage = "configurando a sessao"
+                    status("Camera aberta, configurando a sessao...")
+                    try {
+                        device.createCaptureSession(
+                            listOf(surface, preview.surface),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(newSession: CameraCaptureSession) {
+                                    session = newSession
+                                    stage = "gravando"
+                                    try {
+                                        val builder = device.createCaptureRequest(
+                                            CameraDevice.TEMPLATE_RECORD
+                                        )
+                                        builder.addTarget(surface)
+                                        builder.addTarget(preview.surface)
+                                        builder.set(
+                                            CaptureRequest.CONTROL_MODE,
+                                            CaptureRequest.CONTROL_MODE_AUTO
+                                        )
+                                        builder.set(
+                                            CaptureRequest.CONTROL_AF_MODE,
+                                            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                                        )
+                                        builder.set(
+                                            CaptureRequest.CONTROL_AE_MODE,
+                                            CaptureRequest.CONTROL_AE_MODE_ON
+                                        )
+                                        newSession.setRepeatingRequest(
+                                            builder.build(), null, bgHandler
+                                        )
+                                        rec.start()
+                                        status("Gravando $label... aguarde ${durationMs / 1000} s.")
+                                    } catch (e: Exception) {
+                                        finishTest(
+                                            "\n=== $title ===\nFALHA ao iniciar: ${e.message}"
+                                        )
+                                        return
+                                    }
+                                    bgHandler.postDelayed({
+                                        stopRecording(
+                                            title, file, width, height, fps,
+                                            bitrateMbps, batteryStart
+                                        )
+                                    }, durationMs)
+                                }
 
-                        override fun onConfigureFailed(failedSession: CameraCaptureSession) {
-                            cleanupCamera()
-                            busy = false
-                            done("=== TESTE DE GRAVACAO $label ===\nFALHA: sessao nao configurada.")
-                        }
-                    },
-                    bgHandler
-                )
-            }
+                                override fun onConfigureFailed(
+                                    failedSession: CameraCaptureSession
+                                ) {
+                                    finishTest(
+                                        "\n=== $title ===\nFALHA: sessao nao configurada."
+                                    )
+                                }
+                            },
+                            bgHandler
+                        )
+                    } catch (e: Exception) {
+                        finishTest("\n=== $title ===\nFALHA ao criar a sessao: ${e.message}")
+                    }
+                }
 
-            override fun onDisconnected(device: CameraDevice) {
-                cleanupCamera()
-                busy = false
-            }
+                override fun onDisconnected(device: CameraDevice) {
+                    finishTest("\n=== $title ===\nCamera desconectada na etapa \"$stage\".")
+                }
 
-            override fun onError(device: CameraDevice, error: Int) {
-                cleanupCamera()
-                busy = false
-                done("=== TESTE DE GRAVACAO $label ===\nERRO de camera: $error")
-            }
-        }, bgHandler)
+                override fun onError(device: CameraDevice, error: Int) {
+                    finishTest("\n=== $title ===\nERRO de camera: $error (etapa \"$stage\")")
+                }
+            }, bgHandler)
+        } catch (e: Exception) {
+            finishTest("\n=== $title ===\nFALHA ao abrir a camera: ${e.message}")
+        }
     }
 
     private fun stopRecording(
-        label: String,
+        title: String,
         file: File,
         width: Int,
         height: Int,
         fps: Int,
         bitrateMbps: Int,
-        batteryStart: String,
-        done: (String) -> Unit
+        batteryStart: String
     ) {
+        stage = "parando e analisando"
         var stopError: String? = null
         try {
             session?.stopRepeating()
@@ -235,19 +322,17 @@ class CameraTester(
         } catch (e: Exception) {
             stopError = e.message
         }
-        cleanupCamera()
-        busy = false
         val batteryEnd = batterySnapshot(context)
-        done(
-            analyzeRecording(
-                label, file, width, height, fps, bitrateMbps,
-                batteryStart, batteryEnd, stopError
-            )
+        // analyzeRecording le o arquivo antes do finishTest limpar tudo.
+        val text = analyzeRecording(
+            title, file, width, height, fps, bitrateMbps,
+            batteryStart, batteryEnd, stopError
         )
+        finishTest(text)
     }
 
     private fun analyzeRecording(
-        label: String,
+        title: String,
         file: File,
         reqWidth: Int,
         reqHeight: Int,
@@ -259,7 +344,7 @@ class CameraTester(
     ): String {
         val sb = StringBuilder()
         sb.appendLine()
-        sb.appendLine("=== TESTE DE GRAVACAO $label ===")
+        sb.appendLine("=== $title ===")
         sb.appendLine("Pedido: ${reqWidth}x$reqHeight @ $reqFps fps, $reqBitrateMbps Mbps")
         sb.appendLine("Inicio: $batteryStart | Fim: $batteryEnd")
         if (stopError != null) sb.appendLine("Aviso ao parar: $stopError")
@@ -355,20 +440,22 @@ class CameraTester(
         status: (String) -> Unit,
         done: (String) -> Unit
     ) {
+        val title = "TESTE DE FOTO RAW"
         if (busy) {
-            done("=== TESTE DE FOTO RAW ===\nOCUPADO: outro teste em andamento.")
+            failBusy(title, done)
             return
         }
+        beginTest(title, 30_000, done)
         val cameraId = CameraProbe.pickMainBackCameraId(manager)
         if (cameraId == null) {
-            done("=== TESTE DE FOTO RAW ===\nSem camera traseira.")
+            finishTest("\n=== $title ===\nSem camera traseira.")
             return
         }
         val chars = manager.getCameraCharacteristics(cameraId)
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val rawSizes = map?.getOutputSizes(ImageFormat.RAW_SENSOR).orEmpty()
         if (rawSizes.isEmpty()) {
-            done("=== TESTE DE FOTO RAW ===\nRAW nao listado para a camera $cameraId.")
+            finishTest("\n=== $title ===\nRAW nao listado para a camera $cameraId.")
             return
         }
         val rawSize = rawSizes.maxByOrNull { it.width * it.height }!!
@@ -376,7 +463,6 @@ class CameraTester(
         val jpegSize = jpegSizes.filter { it.width == rawSize.width && it.height == rawSize.height }
             .firstOrNull() ?: jpegSizes.maxByOrNull { it.width * it.height } ?: rawSize
 
-        busy = true
         outDir.mkdirs()
         status("Capturando foto RAW de teste (${rawSize.width}x${rawSize.height})...")
         val rawReader = ImageReader.newInstance(
@@ -385,25 +471,25 @@ class CameraTester(
         val jpegReader = ImageReader.newInstance(
             jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2
         )
+        rawReaderRef = rawReader
+        jpegReaderRef = jpegReader
+        val preview = newPreviewReader()
 
         var rawImage: Image? = null
         var jpegImage: Image? = null
         var captureResult: TotalCaptureResult? = null
-        var saved = false
 
         fun trySave() {
-            synchronized(this) {
-                if (saved || rawImage == null || jpegImage == null || captureResult == null) {
-                    return
-                }
-                saved = true
-            }
+            if (finished) return
+            val raw = rawImage ?: return
+            val jpeg = jpegImage ?: return
+            val result = captureResult ?: return
             val sb = StringBuilder()
             sb.appendLine()
-            sb.appendLine("=== TESTE DE FOTO RAW ===")
+            sb.appendLine("=== $title ===")
             try {
                 val jpegFile = File(outDir, "teste_foto.jpg")
-                val buffer = jpegImage!!.planes[0].buffer
+                val buffer = jpeg.planes[0].buffer
                 val bytes = ByteArray(buffer.remaining())
                 buffer.get(bytes)
                 FileOutputStream(jpegFile).use { it.write(bytes) }
@@ -412,9 +498,9 @@ class CameraTester(
                         String.format(Locale.US, "%.2f", jpegFile.length() / 1_000_000.0) + " MB"
                 )
                 val dngFile = File(outDir, "teste_foto.dng")
-                DngCreator(chars, captureResult!!).use { dng ->
+                DngCreator(chars, result).use { dng ->
                     FileOutputStream(dngFile).use { stream ->
-                        dng.writeImage(stream, rawImage!!)
+                        dng.writeImage(stream, raw)
                     }
                 }
                 sb.appendLine(
@@ -428,137 +514,131 @@ class CameraTester(
                 sb.appendLine("FALHA ao salvar: ${e.message}")
             } finally {
                 try {
-                    rawImage?.close()
-                    jpegImage?.close()
-                    rawReader.close()
-                    jpegReader.close()
+                    raw.close()
+                    jpeg.close()
                 } catch (e: Exception) {
                 }
-                cleanupCamera()
-                busy = false
             }
-            done(sb.toString())
+            finishTest(sb.toString())
         }
 
         rawReader.setOnImageAvailableListener({ reader ->
-            rawImage?.close()
-            rawImage = reader.acquireLatestImage()
+            try {
+                rawImage?.close()
+                rawImage = reader.acquireLatestImage()
+            } catch (e: Exception) {
+            }
             trySave()
         }, bgHandler)
         jpegReader.setOnImageAvailableListener({ reader ->
-            jpegImage?.close()
-            jpegImage = reader.acquireLatestImage()
+            try {
+                jpegImage?.close()
+                jpegImage = reader.acquireLatestImage()
+            } catch (e: Exception) {
+            }
             trySave()
         }, bgHandler)
 
-        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-            override fun onOpened(device: CameraDevice) {
-                cameraDevice = device
-                device.createCaptureSession(
-                    listOf(rawReader.surface, jpegReader.surface),
-                    object : CameraCaptureSession.StateCallback() {
-                        override fun onConfigured(newSession: CameraCaptureSession) {
-                            session = newSession
-                            try {
-                                val previewBuilder =
-                                    device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-                                previewBuilder.addTarget(rawReader.surface)
-                                previewBuilder.set(
-                                    CaptureRequest.CONTROL_AF_MODE,
-                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                                )
-                                previewBuilder.set(
-                                    CaptureRequest.CONTROL_AE_MODE,
-                                    CaptureRequest.CONTROL_AE_MODE_ON
-                                )
-                                newSession.setRepeatingRequest(
-                                    previewBuilder.build(), null, bgHandler
-                                )
-                            } catch (e: Exception) {
-                                // Segue para a captura mesmo sem previa continua.
-                            }
-                            bgHandler.postDelayed({
-                                try {
-                                    val captureBuilder = device.createCaptureRequest(
-                                        CameraDevice.TEMPLATE_STILL_CAPTURE
-                                    )
-                                    captureBuilder.addTarget(rawReader.surface)
-                                    captureBuilder.addTarget(jpegReader.surface)
-                                    captureBuilder.set(
-                                        CaptureRequest.CONTROL_AF_MODE,
-                                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                                    )
-                                    captureBuilder.set(
-                                        CaptureRequest.CONTROL_AE_MODE,
-                                        CaptureRequest.CONTROL_AE_MODE_ON
-                                    )
-                                    captureBuilder.set(
-                                        CaptureRequest.JPEG_ORIENTATION, 90
-                                    )
-                                    newSession.capture(
-                                        captureBuilder.build(),
-                                        object : CameraCaptureSession.CaptureCallback() {
-                                            override fun onCaptureCompleted(
-                                                completedSession: CameraCaptureSession,
-                                                request: CaptureRequest,
-                                                result: TotalCaptureResult
-                                            ) {
-                                                captureResult = result
-                                                trySave()
-                                            }
-                                        },
-                                        bgHandler
-                                    )
-                                } catch (e: Exception) {
-                                    cleanupCamera()
-                                    busy = false
-                                    done(
-                                        "=== TESTE DE FOTO RAW ===\n" +
-                                            "FALHA na captura: ${e.message}"
-                                    )
-                                }
-                            }, 1500)
-                            bgHandler.postDelayed({
-                                synchronized(this@CameraTester) {
-                                    if (!saved && busy) {
-                                        saved = true
-                                        try {
-                                            rawReader.close()
-                                            jpegReader.close()
-                                        } catch (e: Exception) {
-                                        }
-                                        cleanupCamera()
-                                        busy = false
-                                        done(
-                                            "=== TESTE DE FOTO RAW ===\n" +
-                                                "Tempo esgotado (10 s) sem receber RAW+JPEG+resultado."
+        stage = "abrindo a camera"
+        try {
+            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(device: CameraDevice) {
+                    cameraDevice = device
+                    stage = "configurando a sessao"
+                    try {
+                        device.createCaptureSession(
+                            listOf(rawReader.surface, jpegReader.surface, preview.surface),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(newSession: CameraCaptureSession) {
+                                    session = newSession
+                                    stage = "aguardando estabilizar e capturando"
+                                    try {
+                                        val previewBuilder = device.createCaptureRequest(
+                                            CameraDevice.TEMPLATE_PREVIEW
                                         )
+                                        previewBuilder.addTarget(preview.surface)
+                                        previewBuilder.set(
+                                            CaptureRequest.CONTROL_AF_MODE,
+                                            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                                        )
+                                        previewBuilder.set(
+                                            CaptureRequest.CONTROL_AE_MODE,
+                                            CaptureRequest.CONTROL_AE_MODE_ON
+                                        )
+                                        newSession.setRepeatingRequest(
+                                            previewBuilder.build(), null, bgHandler
+                                        )
+                                    } catch (e: Exception) {
+                                        // Segue para a captura mesmo sem previa continua.
                                     }
+                                    bgHandler.postDelayed({
+                                        if (finished) return@postDelayed
+                                        try {
+                                            val captureBuilder = device.createCaptureRequest(
+                                                CameraDevice.TEMPLATE_STILL_CAPTURE
+                                            )
+                                            captureBuilder.addTarget(rawReader.surface)
+                                            captureBuilder.addTarget(jpegReader.surface)
+                                            captureBuilder.set(
+                                                CaptureRequest.CONTROL_AF_MODE,
+                                                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                                            )
+                                            captureBuilder.set(
+                                                CaptureRequest.CONTROL_AE_MODE,
+                                                CaptureRequest.CONTROL_AE_MODE_ON
+                                            )
+                                            captureBuilder.set(
+                                                CaptureRequest.JPEG_ORIENTATION, 90
+                                            )
+                                            newSession.capture(
+                                                captureBuilder.build(),
+                                                object :
+                                                    CameraCaptureSession.CaptureCallback() {
+                                                    override fun onCaptureCompleted(
+                                                        completedSession: CameraCaptureSession,
+                                                        request: CaptureRequest,
+                                                        result: TotalCaptureResult
+                                                    ) {
+                                                        captureResult = result
+                                                        trySave()
+                                                    }
+                                                },
+                                                bgHandler
+                                            )
+                                        } catch (e: Exception) {
+                                            finishTest(
+                                                "\n=== $title ===\nFALHA na captura: ${e.message}"
+                                            )
+                                        }
+                                    }, 1500)
                                 }
-                            }, 10_000)
-                        }
 
-                        override fun onConfigureFailed(failedSession: CameraCaptureSession) {
-                            cleanupCamera()
-                            busy = false
-                            done("=== TESTE DE FOTO RAW ===\nFALHA: sessao nao configurada.")
-                        }
-                    },
-                    bgHandler
-                )
-            }
+                                override fun onConfigureFailed(
+                                    failedSession: CameraCaptureSession
+                                ) {
+                                    finishTest(
+                                        "\n=== $title ===\nFALHA: sessao nao configurada."
+                                    )
+                                }
+                            },
+                            bgHandler
+                        )
+                    } catch (e: Exception) {
+                        finishTest("\n=== $title ===\nFALHA ao criar a sessao: ${e.message}")
+                    }
+                }
 
-            override fun onDisconnected(device: CameraDevice) {
-                cleanupCamera()
-                busy = false
-            }
+                override fun onDisconnected(device: CameraDevice) {
+                    finishTest("\n=== $title ===\nCamera desconectada na etapa \"$stage\".")
+                }
 
-            override fun onError(device: CameraDevice, error: Int) {
-                cleanupCamera()
-                busy = false
-                done("=== TESTE DE FOTO RAW ===\nERRO de camera: $error")
-            }
-        }, bgHandler)
+                override fun onError(device: CameraDevice, error: Int) {
+                    finishTest("\n=== $title ===\nERRO de camera: $error (etapa \"$stage\")")
+                }
+            }, bgHandler)
+        } catch (e: Exception) {
+            finishTest("\n=== $title ===\nFALHA ao abrir a camera: ${e.message}")
+        }
     }
 
     // ---------------------------------------------------------------

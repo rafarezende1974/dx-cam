@@ -224,7 +224,9 @@ class MainActivity : ComponentActivity() {
 
     private fun appendSection(section: String) {
         runOnUiThread {
+            if (report.isNotEmpty() && !report.endsWith("\n")) report.append("\n")
             report.append(section)
+            if (!section.endsWith("\n")) report.append("\n")
             reportText.text = report.toString()
             setStatus("Teste concluido e somado ao relatorio.")
         }
