@@ -173,6 +173,10 @@ class CamState(context: Context) {
     var lastRemoteIp: String = prefs.getString("lastRemoteIp", "") ?: ""
         set(value) { field = value; save() }
 
+    // v2 Etapa 5: IPs dos 4 slots da multicam, separados por "|".
+    var mcIps: String = prefs.getString("mcIps", "") ?: ""
+        set(value) { field = value; save() }
+
     val mode: VideoMode get() = VideoModes.ALL[modeIndex]
 
     /** Bitrate efetivo do modo atual conforme o nivel (sempre visivel). */
@@ -231,6 +235,7 @@ class CamState(context: Context) {
             .putInt("trailBlend", trailBlend)
             .putFloat("timelapseSec", timelapseSec)
             .putString("lastRemoteIp", lastRemoteIp)
+            .putString("mcIps", mcIps)
             .apply()
     }
 

@@ -206,6 +206,23 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     private var lapelStartedAt: Long = 0
     private var lapelTick: Runnable? = null
 
+    // v2 Etapa 5: multicam (o tablet controlando ate 4 cameras).
+    private lateinit var multicamView: LinearLayout
+    private lateinit var mcSessionLabel: TextView
+    private var mcSessionTag: String = ""
+
+    private inner class McSlot(val index: Int) {
+        var client: RemoteClient? = null
+        lateinit var ipField: EditText
+        lateinit var codeField: EditText
+        lateinit var image: ImageView
+        lateinit var stateLabel: TextView
+        lateinit var connectButton: Button
+        var recording: Boolean = false
+    }
+
+    private val mcSlots: List<McSlot> = List(4) { McSlot(it) }
+
     private val cellValues = mutableMapOf<Control, TextView>()
     private val cellNames = mutableMapOf<Control, TextView>()
     private var selected: Control? = null
@@ -279,6 +296,9 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         stopLapelTick()
         lapelCapture?.stop()
         lapelClient?.close()
+        for (slot in mcSlots) {
+            slot.client?.close()
+        }
         remoteServer?.stop()
         remoteClient?.close()
         engine.close()
@@ -591,6 +611,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         buildViewerView()
         buildControllerView()
         buildLapelView()
+        buildMulticamView()
         setContentView(rootFrame)
         refreshModeUi()
         refreshHud()
@@ -1802,6 +1823,11 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "focusAF" -> state.focusMode = FocusMode.CONTINUOUS
             "ev" -> value.toFloatOrNull()?.let { state.ev = it }
             "zoom" -> value.toFloatOrNull()?.let { state.zoomRatio = it }
+            "project" -> {
+                state.projectPrefix = value
+                    .replace(Regex("[^A-Za-z0-9_-]"), "_")
+                    .take(24)
+            }
             else -> return
         }
         engine.applyState()
@@ -2163,6 +2189,282 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         lapelLevel.progress = 0
         lapelToggle.text = "CONECTAR E GRAVAR"
         lapelStatus.text = message
+    }
+
+    // ---------------------------------------------------------------
+    // v2 Etapa 5: multicam (ate 4 cameras num controle so)
+    // ---------------------------------------------------------------
+    private fun mcIpAt(index: Int): String {
+        return state.mcIps.split("|").getOrNull(index) ?: ""
+    }
+
+    private fun saveMcIp(index: Int, ip: String) {
+        val parts = state.mcIps.split("|").toMutableList()
+        while (parts.size < 4) parts.add("")
+        parts[index] = ip
+        state.mcIps = parts.joinToString("|")
+    }
+
+    private fun buildMulticamView() {
+        multicamView = LinearLayout(this)
+        multicamView.orientation = LinearLayout.VERTICAL
+        multicamView.setBackgroundColor(0xFF0B1220.toInt())
+        multicamView.setPadding(dp(10), dp(8), dp(10), dp(8))
+        multicamView.visibility = View.GONE
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.HORIZONTAL
+        header.gravity = Gravity.CENTER_VERTICAL
+        val title = label(
+            "MULTICAM — ate 4 cameras", 14f, Color.WHITE, bold = true
+        )
+        header.addView(
+            title,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val closeButton = smallButton("FECHAR")
+        closeButton.setOnClickListener {
+            multicamView.visibility = View.GONE
+        }
+        header.addView(closeButton)
+        multicamView.addView(header)
+        val sessionRow = LinearLayout(this)
+        sessionRow.orientation = LinearLayout.HORIZONTAL
+        sessionRow.gravity = Gravity.CENTER_VERTICAL
+        sessionRow.setPadding(0, dp(4), 0, dp(4))
+        mcSessionLabel = label(
+            "Sem sessao: REC TODAS ja vale. A sessao so unifica o nome " +
+                "dos arquivos (projeto) em todas as cameras.",
+            11f, MUTED
+        )
+        sessionRow.addView(
+            mcSessionLabel,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val sessionButton = smallButton("NOVA SESSAO")
+        sessionButton.setOnClickListener { applyMcSession() }
+        sessionRow.addView(sessionButton)
+        multicamView.addView(sessionRow)
+        for (rowIndex in 0 until 2) {
+            val rowLayout = LinearLayout(this)
+            rowLayout.orientation = LinearLayout.HORIZONTAL
+            for (colIndex in 0 until 2) {
+                val slot = mcSlots[rowIndex * 2 + colIndex]
+                val card = buildMcSlotCard(slot)
+                val cardParams = LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.MATCH_PARENT, 1f
+                )
+                if (colIndex == 1) cardParams.leftMargin = dp(8)
+                rowLayout.addView(card, cardParams)
+            }
+            val rowParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+            if (rowIndex == 1) rowParams.topMargin = dp(8)
+            multicamView.addView(rowLayout, rowParams)
+        }
+        val globals = LinearLayout(this)
+        globals.orientation = LinearLayout.HORIZONTAL
+        globals.gravity = Gravity.CENTER
+        globals.setPadding(0, dp(8), 0, 0)
+        val recAll = Button(this)
+        recAll.text = "● REC TODAS"
+        recAll.setOnClickListener { mcBroadcast("REC_START") }
+        globals.addView(recAll, LinearLayout.LayoutParams(dp(170), dp(52)))
+        val stopAll = Button(this)
+        stopAll.text = "■ PARAR TODAS"
+        stopAll.setOnClickListener { mcBroadcast("REC_STOP") }
+        val stopParams = LinearLayout.LayoutParams(dp(170), dp(52))
+        stopParams.leftMargin = dp(10)
+        globals.addView(stopAll, stopParams)
+        val photoAll = Button(this)
+        photoAll.text = "FOTO TODAS"
+        photoAll.setOnClickListener { mcBroadcast("PHOTO") }
+        val photoParams = LinearLayout.LayoutParams(dp(150), dp(52))
+        photoParams.leftMargin = dp(10)
+        globals.addView(photoAll, photoParams)
+        multicamView.addView(globals)
+        rootFrame.addView(multicamView, overlayParams())
+    }
+
+    private fun buildMcSlotCard(slot: McSlot): LinearLayout {
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.setBackgroundColor(0xFF111A2E.toInt())
+        card.setPadding(dp(8), dp(6), dp(8), dp(6))
+        val topRow = LinearLayout(this)
+        topRow.orientation = LinearLayout.HORIZONTAL
+        topRow.gravity = Gravity.CENTER_VERTICAL
+        val name = label(
+            "CAM ${slot.index + 1}", 12.5f, Color.WHITE, bold = true
+        )
+        topRow.addView(
+            name,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        slot.connectButton = smallButton("CONECTAR")
+        slot.connectButton.setOnClickListener { toggleMcSlot(slot) }
+        topRow.addView(slot.connectButton)
+        card.addView(topRow)
+        val fieldsRow = LinearLayout(this)
+        fieldsRow.orientation = LinearLayout.HORIZONTAL
+        slot.ipField = EditText(this)
+        slot.ipField.hint = "IP da camera"
+        slot.ipField.setText(mcIpAt(slot.index))
+        slot.ipField.setTextColor(Color.WHITE)
+        slot.ipField.setHintTextColor(MUTED)
+        slot.ipField.textSize = 12f
+        fieldsRow.addView(
+            slot.ipField,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        slot.codeField = EditText(this)
+        slot.codeField.hint = "Codigo"
+        slot.codeField.setTextColor(Color.WHITE)
+        slot.codeField.setHintTextColor(MUTED)
+        slot.codeField.textSize = 12f
+        slot.codeField.inputType =
+            android.text.InputType.TYPE_CLASS_NUMBER
+        val codeParams = LinearLayout.LayoutParams(
+            dp(76), ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        codeParams.leftMargin = dp(6)
+        fieldsRow.addView(slot.codeField, codeParams)
+        card.addView(fieldsRow)
+        slot.image = ImageView(this)
+        slot.image.setBackgroundColor(Color.BLACK)
+        slot.image.scaleType = ImageView.ScaleType.FIT_CENTER
+        card.addView(
+            slot.image,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+        )
+        slot.stateLabel = label("Sem conexao.", 11f, MUTED)
+        slot.stateLabel.setPadding(0, dp(4), 0, 0)
+        card.addView(slot.stateLabel)
+        return card
+    }
+
+    private fun openMulticam() {
+        if (engine.recording) {
+            showStatus("Termine a gravacao para abrir a multicam.")
+            return
+        }
+        multicamView.visibility = View.VISIBLE
+    }
+
+    private fun toggleMcSlot(slot: McSlot) {
+        val existing = slot.client
+        if (existing != null) {
+            existing.close()
+            slot.client = null
+            slot.recording = false
+            slot.connectButton.text = "CONECTAR"
+            slot.stateLabel.text = "Desconectada."
+            return
+        }
+        val ip = slot.ipField.text.toString().trim()
+        val code = slot.codeField.text.toString().trim()
+        if (ip.isEmpty() || code.isEmpty()) {
+            showStatus(
+                "CAM ${slot.index + 1}: digite o IP e o codigo da camera."
+            )
+            return
+        }
+        saveMcIp(slot.index, ip)
+        val client = RemoteClient(
+            object : RemoteClient.Listener {
+                override fun onConnected() {
+                    uiHandler.post {
+                        slot.connectButton.text = "DESCONECTAR"
+                        slot.stateLabel.text = "Conectada. Aguardando previa..."
+                        if (mcSessionTag.isNotEmpty()) {
+                            slot.client?.sendCommand(
+                                "SET project $mcSessionTag"
+                            )
+                        }
+                    }
+                }
+
+                override fun onFrame(jpeg: ByteArray) {
+                    val bitmap = BitmapFactory.decodeByteArray(
+                        jpeg, 0, jpeg.size
+                    )
+                    if (bitmap != null) {
+                        uiHandler.post { slot.image.setImageBitmap(bitmap) }
+                    }
+                }
+
+                override fun onText(text: String) {
+                    if (text.startsWith("STATE ")) {
+                        uiHandler.post { applyMcSlotState(slot, text) }
+                    }
+                }
+
+                override fun onDisconnected(message: String) {
+                    uiHandler.post {
+                        slot.client = null
+                        slot.recording = false
+                        slot.connectButton.text = "CONECTAR"
+                        slot.stateLabel.text = message
+                    }
+                }
+            }
+        )
+        slot.client = client
+        slot.stateLabel.text = "Conectando em $ip..."
+        client.connect(ip, code)
+    }
+
+    private fun applyMcSlotState(slot: McSlot, text: String) {
+        val fields = text.removePrefix("STATE ").split(" ")
+            .mapNotNull {
+                val parts = it.split("=", limit = 2)
+                if (parts.size == 2) parts[0] to parts[1] else null
+            }
+            .toMap()
+        slot.recording = fields["rec"] == "1"
+        val lapel = if (fields["mic"] == "1") " · lapela ON" else ""
+        slot.stateLabel.text =
+            "${fields["modo"] ?: "-"} · ISO ${fields["iso"] ?: "-"} · " +
+                "bat ${fields["bat"] ?: "-"} · " +
+                (if (slot.recording) "GRAVANDO" else "em espera") + lapel
+    }
+
+    private fun mcBroadcast(command: String) {
+        var sent = 0
+        for (slot in mcSlots) {
+            val client = slot.client
+            if (client != null && client.connected) {
+                client.sendCommand(command)
+                sent++
+            }
+        }
+        showStatus(
+            if (sent == 0) {
+                "Nenhuma camera conectada na multicam."
+            } else {
+                "$command enviado para $sent camera(s)."
+            }
+        )
+    }
+
+    private fun applyMcSession() {
+        mcSessionTag = "MC_" + SimpleDateFormat(
+            "HHmmss", Locale.US
+        ).format(Date())
+        var sent = 0
+        for (slot in mcSlots) {
+            val client = slot.client
+            if (client != null && client.connected) {
+                client.sendCommand("SET project $mcSessionTag")
+                sent++
+            }
+        }
+        mcSessionLabel.text =
+            "Sessao $mcSessionTag aplicada em $sent camera(s): os " +
+                "arquivos saem DXCam_${mcSessionTag}_data_hora em todas. " +
+                "Camera que conectar depois recebe a sessao sozinha."
     }
 
     private fun startRemoteStateTick() {
@@ -2797,6 +3099,13 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         val lapelButton = smallButton("MODO LAPELA (este aparelho vira microfone)")
         lapelButton.setOnClickListener { openLapel() }
         lapelRow.addView(lapelButton)
+        val mcButton = smallButton("MULTICAM (ate 4 cameras)")
+        mcButton.setOnClickListener { openMulticam() }
+        val mcParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        mcParams.leftMargin = dp(8)
+        lapelRow.addView(mcButton, mcParams)
         val remoteInfo = label(
             if (armed) {
                 "Armada: IP ${localIpAddress()} · porta ${RemoteProtocol.PORT} · " +
@@ -2823,7 +3132,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "-"
         }
         val about = label(
-            "DX Cam v2.3.0-lapela — DX Labs\n" +
+            "DX Cam v2.4.0-multicam — DX Labs\n" +
                 "Camera de cinema para o S24: video manual, foto RAW, " +
                 "monitoramento e LUT so na previa.\n" +
                 "Espaco livre no aparelho: $free.",
