@@ -6,7 +6,9 @@ App Android da DX Labs estilo Rabbit Cam / Blackmagic Camera: transforma o Galax
 - **Aparelho principal:** Galaxy S24 · **secundário:** Galaxy Tab S9+
 - **Plano da v1:** documento "Plano DX Cam v1" (documentos do DX Cam, fora deste repo)
 
-## Estado atual: v1 em construção — Etapa 3 (gravação completa), v0.3.0-rec
+## Estado atual: v1 em construção — Etapa 3 (gravação completa), v0.3.1-rec
+
+> v0.3.1 corrige o build vermelho da v0.3.0: `MediaRecorder.setOnInfoListener(listener, handler)` não existe na API pública visível ao compilador — fica a versão de um argumento (os eventos de divisão são raros e chegam na thread principal).
 
 > **Fase 0 FECHADA em 25/11/2026** (3 relatórios do S24; resultados e decisões travadas no adendo do plano). Etapa 2 (v0.2.1-core, confirmada por ele no S24): visor em tela cheia, faixa manual com valores reais, painel de ajuste fino, travas, foco por toque, zoom por pinça e estado persistente. **Etapa 3 (v0.3.0-rec):** destinos interno (`Movies/DXCam`) ou SSD (pasta via SAF com permissão persistente, botão SSD no topo; toque longo troca a pasta), bitrate em 3 níveis (ECO/PADRÃO/ALTO, Mbps efetivo sempre no botão do modo), nomeação `DXCam[_projeto]_AAAAMMDD_HHMMSS[_parteN].mp4` (projeto via toque longo no botão do modo) e divisão automática em ~3,8 GB sem perder quadros. Próximas etapas: 4) monitoramento, 5) LUT, 6) foto, 7) mídia/configurações, 8) teste de campo. Guias: `TESTE-ETAPA-2.md` e `TESTE-ETAPA-3.md`.
 

@@ -564,9 +564,13 @@ class CameraEngine(
             rec.setOrientationHint(sensorOrientation)
             rec.setOutputFile(first.pfd.fileDescriptor)
             rec.setMaxFileSize(SPLIT_BYTES)
-            rec.setOnInfoListener({ _, what, _ ->
+            // Sem a sobrecarga com Handler: ela nao existe na API publica
+            // visivel ao compilador (erro de build da v0.3.0). Os eventos
+            // sao raros (so nas divisoes de arquivo) e chegam na thread
+            // principal, o que basta para preparar a proxima parte.
+            rec.setOnInfoListener { _, what, _ ->
                 onRecorderInfo(what)
-            }, bgHandler)
+            }
             rec.prepare()
         } catch (e: Exception) {
             transitioning = false

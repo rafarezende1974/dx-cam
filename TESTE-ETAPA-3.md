@@ -1,4 +1,4 @@
-# DX Cam — Teste da Etapa 3 (gravação completa) — v0.3.0-rec
+# DX Cam — Teste da Etapa 3 (gravação completa) — v0.3.1-rec
 
 **Desinstale a versão anterior antes de instalar** (assinatura de debug muda a cada build).
 
