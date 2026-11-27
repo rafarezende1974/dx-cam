@@ -209,7 +209,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     // v2 Etapa 5: multicam (o tablet controlando ate 4 cameras).
     private lateinit var multicamView: LinearLayout
     private lateinit var mcSessionLabel: TextView
+    private lateinit var mcFeedback: TextView
+    private lateinit var controllerFeedback: TextView
     private var mcSessionTag: String = ""
+    private var lastRemoteEvent: String = ""
 
     private inner class McSlot(val index: Int) {
         var client: RemoteClient? = null
@@ -1775,18 +1778,26 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         val command = text.removePrefix("CMD ").trim()
         // Eco na tela da camera: quem esta perto dela ve o comando chegar.
         showStatus("Controle: $command")
+        var result = "recebido"
         when {
             command == "REC_START" -> {
                 when {
-                    engine.recording ->
+                    engine.recording -> {
                         remoteServer?.sendText("ACK REC_START ja gravando")
-                    !engineOpened ->
+                        result = "ACK (ja estava gravando)"
+                    }
+                    !engineOpened -> {
                         remoteServer?.sendText("ERR REC_START camera abrindo")
-                    engine.isTransitioning ->
+                        result = "ERR camera abrindo"
+                    }
+                    engine.isTransitioning -> {
                         remoteServer?.sendText("ERR REC_START camera ocupada")
+                        result = "ERR camera ocupada"
+                    }
                     else -> {
                         onRecTapped()
                         remoteServer?.sendText("ACK REC_START")
+                        result = "ACK gravando"
                     }
                 }
             }
@@ -1794,8 +1805,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 if (engine.recording) {
                     onRecTapped()
                     remoteServer?.sendText("ACK REC_STOP")
+                    result = "ACK parou"
                 } else {
                     remoteServer?.sendText("ACK REC_STOP ja parado")
+                    result = "ACK (ja estava parado)"
                 }
             }
             command == "PHOTO" -> {
@@ -1803,14 +1816,17 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                     remoteServer?.sendText(
                         "ERR PHOTO foto nao sai durante a gravacao"
                     )
+                    result = "ERR foto durante a gravacao"
                 } else {
                     capturePhoto()
                     remoteServer?.sendText("ACK PHOTO")
+                    result = "ACK foto"
                 }
             }
             command.startsWith("SET ") -> {
                 val parts = command.split(" ")
                 if (parts.size == 3) applyRemoteSet(parts[1], parts[2])
+                result = "ajuste aplicado"
             }
             command.startsWith("TAPFOCUS ") -> {
                 val parts = command.split(" ")
@@ -1819,8 +1835,13 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 if (fx != null && fy != null) {
                     applyTapFocusFraction(fx, fy)
                 }
+                result = "foco por toque"
             }
         }
+        lastRemoteEvent =
+            SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()) +
+                " — $command → $result"
+        if (currentTab == TabKind.SETTINGS) buildSettings()
         sendRemoteState()
     }
 
@@ -2271,6 +2292,12 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         sessionButton.setOnClickListener { applyMcSession() }
         sessionRow.addView(sessionButton)
         multicamView.addView(sessionRow)
+        mcFeedback = label(
+            "Respostas das cameras aparecem aqui.",
+            12f, Color.WHITE, bold = true
+        )
+        mcFeedback.setPadding(0, dp(2), 0, dp(6))
+        multicamView.addView(mcFeedback)
         for (rowIndex in 0 until 2) {
             val rowLayout = LinearLayout(this)
             rowLayout.orientation = LinearLayout.HORIZONTAL
@@ -2429,9 +2456,8 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                         text.startsWith("ACK ") || text.startsWith("ERR ")
                     ) {
                         uiHandler.post {
-                            showStatus(
+                            mcFeedback.text =
                                 "CAM ${slot.index + 1} respondeu: $text"
-                            )
                         }
                     }
                 }
@@ -2475,13 +2501,12 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 sent++
             }
         }
-        showStatus(
+        mcFeedback.text =
             if (sent == 0) {
                 "Nenhuma camera conectada na multicam."
             } else {
-                "$command enviado para $sent camera(s)."
+                "$command enviado para $sent camera(s): aguardando resposta..."
             }
-        )
     }
 
     private fun applyMcSession() {
@@ -2666,6 +2691,12 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         photoParams.leftMargin = dp(10)
         controls.addView(photoButton, photoParams)
         controllerView.addView(controls)
+        controllerFeedback = label(
+            "Respostas da camera aparecem aqui.",
+            12f, Color.WHITE, bold = true
+        )
+        controllerFeedback.setPadding(0, dp(6), 0, 0)
+        controllerView.addView(controllerFeedback)
         rootFrame.addView(controllerView, overlayParams())
     }
 
@@ -2851,7 +2882,8 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                         text.startsWith("ACK ") || text.startsWith("ERR ")
                     ) {
                         uiHandler.post {
-                            showStatus("Camera respondeu: $text")
+                            controllerFeedback.text =
+                                "Camera respondeu: $text"
                         }
                     }
                 }
@@ -3155,6 +3187,11 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                         "controle CONECTADO (monitor ativo)."
                     } else {
                         "aguardando o controle conectar."
+                    } +
+                    if (lastRemoteEvent.isNotEmpty()) {
+                        "\nUltimo comando do controle: $lastRemoteEvent"
+                    } else {
+                        ""
                     }
             } else {
                 "Armar: este aparelho vira a camera controlada. " +
@@ -3173,7 +3210,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "-"
         }
         val about = label(
-            "DX Cam v2.4.1-comandos — DX Labs\n" +
+            "DX Cam v2.4.2-feedback — DX Labs\n" +
                 "Camera de cinema para o S24: video manual, foto RAW, " +
                 "monitoramento e LUT so na previa.\n" +
                 "Espaco livre no aparelho: $free.",
