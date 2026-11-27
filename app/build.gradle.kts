@@ -13,8 +13,8 @@ android {
         applicationId = "br.com.dxlabs.dxcam"
         minSdk = 33
         targetSdk = 36
-        versionCode = 18
-        versionName = "2.4.0-multicam"
+        versionCode = 19
+        versionName = "2.4.1-comandos"
     }
 
     buildTypes {

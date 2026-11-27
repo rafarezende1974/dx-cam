@@ -1773,14 +1773,41 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
     private fun handleRemoteCommand(text: String) {
         val command = text.removePrefix("CMD ").trim()
+        // Eco na tela da camera: quem esta perto dela ve o comando chegar.
+        showStatus("Controle: $command")
         when {
             command == "REC_START" -> {
-                if (!engine.recording) onRecTapped()
+                when {
+                    engine.recording ->
+                        remoteServer?.sendText("ACK REC_START ja gravando")
+                    !engineOpened ->
+                        remoteServer?.sendText("ERR REC_START camera abrindo")
+                    engine.isTransitioning ->
+                        remoteServer?.sendText("ERR REC_START camera ocupada")
+                    else -> {
+                        onRecTapped()
+                        remoteServer?.sendText("ACK REC_START")
+                    }
+                }
             }
             command == "REC_STOP" -> {
-                if (engine.recording) onRecTapped()
+                if (engine.recording) {
+                    onRecTapped()
+                    remoteServer?.sendText("ACK REC_STOP")
+                } else {
+                    remoteServer?.sendText("ACK REC_STOP ja parado")
+                }
             }
-            command == "PHOTO" -> capturePhoto()
+            command == "PHOTO" -> {
+                if (engine.recording) {
+                    remoteServer?.sendText(
+                        "ERR PHOTO foto nao sai durante a gravacao"
+                    )
+                } else {
+                    capturePhoto()
+                    remoteServer?.sendText("ACK PHOTO")
+                }
+            }
             command.startsWith("SET ") -> {
                 val parts = command.split(" ")
                 if (parts.size == 3) applyRemoteSet(parts[1], parts[2])
@@ -2398,6 +2425,14 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 override fun onText(text: String) {
                     if (text.startsWith("STATE ")) {
                         uiHandler.post { applyMcSlotState(slot, text) }
+                    } else if (
+                        text.startsWith("ACK ") || text.startsWith("ERR ")
+                    ) {
+                        uiHandler.post {
+                            showStatus(
+                                "CAM ${slot.index + 1} respondeu: $text"
+                            )
+                        }
                     }
                 }
 
@@ -2812,6 +2847,12 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
                 override fun onText(text: String) {
                     if (text.startsWith("STATE ")) {
                         uiHandler.post { applyControllerState(text) }
+                    } else if (
+                        text.startsWith("ACK ") || text.startsWith("ERR ")
+                    ) {
+                        uiHandler.post {
+                            showStatus("Camera respondeu: $text")
+                        }
                     }
                 }
 
@@ -3132,7 +3173,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "-"
         }
         val about = label(
-            "DX Cam v2.4.0-multicam — DX Labs\n" +
+            "DX Cam v2.4.1-comandos — DX Labs\n" +
                 "Camera de cinema para o S24: video manual, foto RAW, " +
                 "monitoramento e LUT so na previa.\n" +
                 "Espaco livre no aparelho: $free.",
@@ -4572,6 +4613,8 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
     }
 
     override fun onError(message: String) {
+        // Com o vinculo ativo, o erro tambem chega ao controle.
+        remoteServer?.sendText("ERR $message")
         uiHandler.post {
             showStatus(message)
             showWarning(message)

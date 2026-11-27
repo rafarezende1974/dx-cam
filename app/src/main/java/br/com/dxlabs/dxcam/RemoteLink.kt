@@ -344,12 +344,27 @@ class RemoteClient(
     }
 
     fun sendCommand(command: String) {
-        val output = out ?: return
+        val output = out
+        if (output == null) {
+            failSend()
+            return
+        }
         try {
             RemoteProtocol.writeText(output, "CMD $command")
         } catch (e: Exception) {
-            // A thread de leitura avisa a queda.
+            failSend()
         }
+    }
+
+    /** Envio falhou: encerra e avisa uma vez (a leitura nao repete). */
+    private fun failSend() {
+        if (!connected) return
+        connected = false
+        try {
+            socket?.close()
+        } catch (e: Exception) {
+        }
+        listener.onDisconnected("Falha ao enviar o comando: conexao caiu.")
     }
 
     /** Texto puro, sem prefixo (ex.: o HELLO da lapela). */
