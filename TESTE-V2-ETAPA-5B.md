@@ -1,31 +1,28 @@
-# DX Cam v2.4.2-feedback — REC TODAS e FOTO TODAS: agora com resposta visível
+# DX Cam v2.4.3-diagnostico — a conexão cai no comando: agora ela diz por quê
 
 **Desinstale a versão anterior antes de instalar** — em todos os
 aparelhos (câmeras e tablet), mesmo APK novo nos dois lados.
 
-## O que estava errado na v2.4.1
-As respostas existiam, mas eram escritas na linha de status da tela
-da câmera — que fica **coberta** pelas telas de Configurações e da
-Multicam justamente durante esse teste. Resultado: "não dá info
-nenhuma". Corrigido: cada tela agora tem a **sua própria** linha de
-resposta, sempre visível.
+## O que o último teste mostrou
+O tablet fica em "aguardando resposta" e a câmera registra que o
+controle **desconectou**: ou seja, a conexão **morre no momento do
+comando**. Esta versão registra o motivo exato da morte nas duas
+pontas, move os envios do tablet para fora da tela (fila própria) e
+ganha um botão **PING** que testa o transporte sem tocar na gravação.
 
-## Onde ler as respostas agora
-- **No tablet, tela Multicam:** linha em destaque logo abaixo do
-  botão NOVA SESSÃO. Ao tocar REC TODAS ela mostra "enviado para N
-  camera(s): aguardando resposta..." e depois **"CAM 1 respondeu:
-  ACK REC_START"** (ou **ERR + motivo**).
-- **Na câmera, aba Configurações → seção Vínculo Remoto:** a linha
-  "Último comando do controle: 23:05:12 — REC_START → ACK gravando"
-  mostra o que chegou nela e o que ela respondeu.
-
-## Reteste
-1. Conecte as câmeras na multicam (prévias no ar).
-2. Toque **● REC TODAS** e leia a linha de resposta do tablet.
-3. Numa das câmeras, abra Configurações e leia a linha do último
-   comando na seção do vínculo.
-4. Repita com **FOTO TODAS**.
-5. Me passe os textos das duas linhas (tablet + uma câmera). Se a
-   linha do tablet ficar só no "aguardando resposta..." e a câmera
-   não registrar comando nenhum, o problema é o comando não chegar —
-   e aí eu ataco o transporte, já sabendo onde ele quebra.
+## Reteste (nesta ordem)
+1. Conecte a câmera na multicam (prévia no ar).
+2. Toque **PING** (ao lado de NOVA SESSÃO) e leia a linha de
+   resposta do tablet:
+   - **"CAM 1 respondeu: ACK PING"** → o transporte está são; o
+     problema mora no REC/FOTO em si. Siga ao passo 3.
+   - **Ficou aguardando / o cartão caiu** → anote o texto que ficou
+     **no cartão da CAM 1** (ele traz o motivo entre parênteses).
+3. Toque **● REC TODAS** e observe a queda:
+   - No **cartão da CAM 1** (tablet): o texto final dele.
+   - Na **câmera** (Configurações → Vínculo Remoto): a linha
+     "Último comando do controle: Controle caiu: ..." — o trecho
+     depois dos dois pontos é o motivo técnico da queda
+     (EOF, exceção ou "pacote invalido" com tipo/tamanho).
+4. Me passe esses dois textos (cartão + linha da câmera). Com o
+   motivo exato, a correção é direta — sem mais uma rodada de chute.

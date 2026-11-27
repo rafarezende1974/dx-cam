@@ -38,16 +38,31 @@ object RemoteProtocol {
         writePacket(out, TYPE_TEXT, text.toByteArray(Charsets.UTF_8))
     }
 
-    /** Le um pacote; null quando a conexao fecha. */
-    fun readPacket(input: DataInputStream): Pair<Byte, ByteArray>? {
+    /**
+     * Le um pacote; null quando a conexao fecha. O motivo exato da
+     * queda (EOF, excecao ou pacote fora de sincronia) vai para
+     * onError quando informado — diagnostico do vinculo.
+     */
+    fun readPacket(
+        input: DataInputStream,
+        onError: ((String) -> Unit)? = null
+    ): Pair<Byte, ByteArray>? {
         return try {
             val type = input.readByte()
             val length = input.readInt()
-            if (length < 0 || length > 4_000_000) return null
+            if (length < 0 || length > 4_000_000) {
+                onError?.invoke(
+                    "pacote invalido: tipo=${type.toInt()} tamanho=$length"
+                )
+                return null
+            }
             val payload = ByteArray(length)
             input.readFully(payload)
             Pair(type, payload)
         } catch (e: Exception) {
+            onError?.invoke(
+                "${e.javaClass.simpleName}: ${e.message ?: "sem detalhe"}"
+            )
             null
         }
     }
@@ -84,6 +99,10 @@ class RemoteServer(
     @Volatile
     var micConnected: Boolean = false
         private set
+
+    /** Motivo da ultima queda do controle (diagnostico do vinculo). */
+    @Volatile
+    var lastDisconnectReason: String = ""
 
     @Volatile
     private var latestFrame: ByteArray? = null
@@ -223,7 +242,9 @@ class RemoteServer(
                     clientConnected = true
                     listener.onClientConnected()
                     while (running && !socket.isClosed) {
-                        val packet = RemoteProtocol.readPacket(input) ?: break
+                        val packet = RemoteProtocol.readPacket(input) { reason ->
+                            lastDisconnectReason = reason
+                        } ?: break
                         if (packet.first == RemoteProtocol.TYPE_TEXT) {
                             listener.onCommand(
                                 String(packet.second, Charsets.UTF_8)
@@ -271,8 +292,17 @@ class RemoteClient(
     var connected: Boolean = false
         private set
 
+    /** Motivo da ultima queda (diagnostico do vinculo). */
+    @Volatile
+    var lastError: String = ""
+
     private var socket: Socket? = null
     private var out: DataOutputStream? = null
+
+    // Todos os envios passam por esta fila: nada de rede na thread
+    // principal, e a ordem dos pacotes e a da chamada.
+    private val writer =
+        java.util.concurrent.Executors.newSingleThreadExecutor()
 
     fun connect(ip: String, pairingCode: String, role: String = "") {
         Thread {
@@ -318,7 +348,9 @@ class RemoteClient(
                 connected = true
                 listener.onConnected()
                 while (connected && !created.isClosed) {
-                    val packet = RemoteProtocol.readPacket(input) ?: break
+                    val packet = RemoteProtocol.readPacket(input) { reason ->
+                        lastError = reason
+                    } ?: break
                     when (packet.first) {
                         RemoteProtocol.TYPE_FRAME -> listener.onFrame(packet.second)
                         RemoteProtocol.TYPE_TEXT ->
@@ -327,7 +359,9 @@ class RemoteClient(
                 }
                 if (connected) {
                     connected = false
-                    listener.onDisconnected("A camera encerrou a conexao.")
+                    listener.onDisconnected(
+                        "A camera encerrou a conexao. ($lastError)"
+                    )
                 }
             } catch (e: Exception) {
                 if (connected) {
@@ -344,15 +378,18 @@ class RemoteClient(
     }
 
     fun sendCommand(command: String) {
-        val output = out
-        if (output == null) {
-            failSend()
-            return
-        }
-        try {
-            RemoteProtocol.writeText(output, "CMD $command")
-        } catch (e: Exception) {
-            failSend()
+        writer.execute {
+            val output = out
+            if (output == null) {
+                failSend()
+                return@execute
+            }
+            try {
+                RemoteProtocol.writeText(output, "CMD $command")
+            } catch (e: Exception) {
+                lastError = "envio: ${e.javaClass.simpleName}: ${e.message}"
+                failSend()
+            }
         }
     }
 
@@ -364,28 +401,34 @@ class RemoteClient(
             socket?.close()
         } catch (e: Exception) {
         }
-        listener.onDisconnected("Falha ao enviar o comando: conexao caiu.")
+        listener.onDisconnected(
+            "Falha ao enviar o comando: conexao caiu. ($lastError)"
+        )
     }
 
     /** Texto puro, sem prefixo (ex.: o HELLO da lapela). */
     fun sendRawText(text: String) {
-        val output = out ?: return
-        try {
-            RemoteProtocol.writeText(output, text)
-        } catch (e: Exception) {
-            // A thread de leitura avisa a queda.
+        writer.execute {
+            val output = out ?: return@execute
+            try {
+                RemoteProtocol.writeText(output, text)
+            } catch (e: Exception) {
+                // A thread de leitura avisa a queda.
+            }
         }
     }
 
     /** Etapa 4: trecho de audio PCM da lapela para a camera. */
     fun sendAudio(pcm: ByteArray) {
-        val output = out ?: return
-        try {
-            RemoteProtocol.writePacket(
-                output, RemoteProtocol.TYPE_AUDIO, pcm
-            )
-        } catch (e: Exception) {
-            // A thread de leitura avisa a queda.
+        writer.execute {
+            val output = out ?: return@execute
+            try {
+                RemoteProtocol.writePacket(
+                    output, RemoteProtocol.TYPE_AUDIO, pcm
+                )
+            } catch (e: Exception) {
+                // A thread de leitura avisa a queda.
+            }
         }
     }
 
@@ -397,5 +440,9 @@ class RemoteClient(
         }
         socket = null
         out = null
+        try {
+            writer.shutdown()
+        } catch (e: Exception) {
+        }
     }
 }

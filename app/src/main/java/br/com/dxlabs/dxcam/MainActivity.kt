@@ -1725,7 +1725,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
 
                 override fun onClientDisconnected() {
                     engine.remoteStreaming = false
+                    val reason = remoteServer?.lastDisconnectReason ?: ""
                     uiHandler.post {
+                        lastRemoteEvent =
+                            "Controle caiu: $reason"
                         showStatus("Controle desconectou.")
                         stopRemoteStateTick()
                         if (currentTab == TabKind.SETTINGS) buildSettings()
@@ -1780,6 +1783,10 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         showStatus("Controle: $command")
         var result = "recebido"
         when {
+            command == "PING" -> {
+                remoteServer?.sendText("ACK PING")
+                result = "ACK ping (transporte ok)"
+            }
             command == "REC_START" -> {
                 when {
                     engine.recording -> {
@@ -2291,6 +2298,13 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
         val sessionButton = smallButton("NOVA SESSAO")
         sessionButton.setOnClickListener { applyMcSession() }
         sessionRow.addView(sessionButton)
+        val pingButton = smallButton("PING")
+        pingButton.setOnClickListener { mcBroadcast("PING") }
+        val pingParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        pingParams.leftMargin = dp(6)
+        sessionRow.addView(pingButton, pingParams)
         multicamView.addView(sessionRow)
         mcFeedback = label(
             "Respostas das cameras aparecem aqui.",
@@ -3210,7 +3224,7 @@ class MainActivity : ComponentActivity(), CameraEngine.Listener {
             "-"
         }
         val about = label(
-            "DX Cam v2.4.2-feedback — DX Labs\n" +
+            "DX Cam v2.4.3-diagnostico — DX Labs\n" +
                 "Camera de cinema para o S24: video manual, foto RAW, " +
                 "monitoramento e LUT so na previa.\n" +
                 "Espaco livre no aparelho: $free.",
